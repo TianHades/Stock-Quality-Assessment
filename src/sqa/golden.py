@@ -42,6 +42,12 @@ GOLDEN: tuple[GoldenCase, ...] = (
     GoldenCase("600941", "中国移动", frozenset({"value", "balanced"}), frozenset({"dividend"}), "tech"),
     GoldenCase("600276", "恒瑞医药", frozenset({"OUT_OF_SCOPE"}), None, None),
     GoldenCase("600036", "招商银行", frozenset({"OUT_OF_SCOPE"}), None, None),
+    # 2026-10-19 C 步扩样：覆盖更多价值/周期/科技与红利组合
+    GoldenCase("000858", "五粮液", frozenset({"value"}), frozenset(), "consumer"),
+    GoldenCase("000651", "格力电器", frozenset({"value"}), frozenset({"dividend"}), "consumer"),
+    GoldenCase("600028", "中国石化", frozenset({"cyclical"}), frozenset(), "other"),
+    GoldenCase("601899", "紫金矿业", frozenset({"cyclical"}), frozenset(), "other"),
+    GoldenCase("002415", "海康威视", frozenset({"value"}), frozenset(), "tech"),
 )
 
 

@@ -18,7 +18,8 @@ class FakePeerClient:
         self.calls.append((api, params))
         codes = ["600001.SH", "600002.SH", "600003.SH"]
         if api == "stock_basic":
-            return [{"ts_code": c, "industry": "煤炭开采"} for c in codes]
+            return [{"ts_code": c, "industry": "煤炭开采",
+                     "list_date": "20100101"} for c in codes]
         if api == "daily_basic":
             return []
         if api == "fina_indicator":
@@ -54,11 +55,26 @@ def test_peer_medians_include_turnover_and_bad_debt():
     assert peers["debt_median"] == pytest.approx(50.0)
     assert peers["assets_turn_median"] == pytest.approx(0.6)
     assert peers["ar_turn_median"] == pytest.approx(10.0)
-    # 三家坏账率均为 10%
+    # 三家坏账率均为 10%，加权计提率也是 10%
     assert peers["bad_debt_ratio_median"] == pytest.approx(10.0)
+    assert peers["bad_debt_ratio_agg"] == pytest.approx(10.0)
     assert peers["n_bad_debt_peers"] == 3
     assert any(api == "income" for api, _ in client.calls)
     assert any(api == "balancesheet" for api, _ in client.calls)
+
+
+def test_peer_medians_exclude_self():
+    client = FakePeerClient()
+    # 行业只有 3 家，排除自身后剩 2 家 → 样本不足，不硬算
+    assert fetch_peer_medians(client, "煤炭开采", exclude_code="600001.SH") is None
+
+
+def test_peer_medians_historical_period_selection():
+    client = FakePeerClient()
+    peers = fetch_peer_medians(client, "煤炭开采", as_of="20210430")
+    assert peers is not None and peers["period"] == "20201231"
+    assert any(call[1].get("period") == "20201231" for call in client.calls
+               if call[0] == "fina_indicator")
 
 
 def test_rule_3_5_bands_and_skips():
@@ -68,6 +84,11 @@ def test_rule_3_5_bands_and_skips():
     assert fin.rule_3_5(income, balance,
                         {"bad_debt_ratio_median": 8.0, "n_bad_debt_peers": 5}
                         ).verdict is MsVerdict.PASS
+    # 加权率优先于中位数：10% vs 加权 20% → WARN（中位数 8% 会被忽略）
+    assert fin.rule_3_5(income, balance,
+                        {"bad_debt_ratio_median": 8.0,
+                         "bad_debt_ratio_agg": 20.0, "n_bad_debt_peers": 5}
+                        ).verdict is MsVerdict.WARN
     # 10% vs 15% → WARN
     assert fin.rule_3_5(income, balance,
                         {"bad_debt_ratio_median": 15.0, "n_bad_debt_peers": 5}

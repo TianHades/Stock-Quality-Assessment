@@ -14,7 +14,9 @@ from sqa.data.fetchers import (
     compute_fcf, fetch_annual_cashflow, fetch_dividend_records,
 )
 from sqa.minesweeper import rules_financial as fin
-from sqa.minesweeper.fetch import fetch_annual_full
+from sqa.minesweeper.fetch import (
+    fetch_annual_full, fetch_holder_ratio_series, fetch_pledge_ratio,
+)
 from sqa.minesweeper.models import MsVerdict
 from sqa.minesweeper import rules_nonfinancial as nonfin
 
@@ -81,6 +83,40 @@ def test_compute_fcf_shared_contract():
                         "c_pay_acq_const_fiolta": 300.0}) == 700.0
     assert compute_fcf({}, {"fcff": 50.0}) == 50.0
     assert compute_fcf({}, None) is None
+
+
+def test_fetch_annual_full_supports_as_of_end_date():
+    rows = [{"end_date": "20221231", "ann_date": "20230401", "report_type": "1",
+             "n_cashflow_act": 100.0, "c_pay_acq_const_fiolta": 30.0},
+            {"end_date": "20221231", "ann_date": "20230510", "report_type": "1",
+             "n_cashflow_act": 999.0, "c_pay_acq_const_fiolta": 30.0}]
+    client = FakeClient({"cashflow": rows})
+    out = fetch_annual_full(client, "cashflow", "600519.SH", 10,
+                            end_date="20230430")
+    call = client.calls[0][1]
+    assert call["end_date"] == "20230430"
+    assert call["start_date"] == "20130101"
+    # 2023-05-10 才公告的年报不得进入 2023-04-30 时点快照
+    assert out[2022]["n_cashflow_act"] == 100.0
+
+
+def test_historical_pledge_and_holder_as_of():
+    pledge = FakeClient({"pledge_stat": [
+        {"end_date": "20201231", "pledge_ratio": 3.0},
+        {"end_date": "20211231", "pledge_ratio": 8.0},
+    ]})
+    assert fetch_pledge_ratio(pledge, "600519.SH", as_of="20210430") == 3.0
+    assert fetch_pledge_ratio(pledge, "600519.SH") == 8.0
+
+    holders = FakeClient({"top10_holders": [
+        {"end_date": "20181231", "hold_ratio": 60.0},
+        {"end_date": "20191231", "hold_ratio": 58.0},
+        {"end_date": "20201231", "hold_ratio": 56.0},
+        {"end_date": "20211231", "hold_ratio": 54.0},
+    ]})
+    series = fetch_holder_ratio_series(holders, "600519.SH", periods=4,
+                                       as_of="20210430")
+    assert series == [60.0, 58.0, 56.0]
 
 
 # ---------- 分红：实施过滤 + 去重 + 税前口径 ----------

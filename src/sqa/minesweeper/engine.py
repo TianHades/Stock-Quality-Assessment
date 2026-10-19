@@ -24,12 +24,16 @@ def run_minesweeper(symbol: str, cfg: Thresholds | None = None,
                     client: TushareClient | None = None,
                     refresh: bool = False, mode: str = "quick",
                     pdf_path: str | None = None,
-                    pdf_url: str | None = None) -> dict:
+                    pdf_url: str | None = None,
+                    as_of: str | None = None) -> dict:
     """主入口：股票代码 → 02 号文档 §6 的 JSON 结构。
 
     mode="deep" 时额外下载/解析年报 PDF，补齐 1.3/5.3/5.4/5.5/5.6/5.9/6.2 七条
     依赖 PDF 的规则，并用 5.8 的 PDF 补充检查覆盖快筛结果；PDF 获取失败时自动
     降级为快筛结果（deep 字段记录失败原因），不影响闸门判定。
+
+    ``as_of``（YYYYMMDD）用于历史时点回测：只取该日期前披露的年报/审计记录；
+    质押、股东、同行等当前快照数据会置空（S1/S4/5.2/3.5 等 SKIP），避免未来函数。
     """
     cfg = cfg or load_thresholds()
     if client is None:
@@ -37,23 +41,39 @@ def run_minesweeper(symbol: str, cfg: Thresholds | None = None,
 
     ts_code = resolve_ts_code(symbol)
     basic = fetch_basic(client, ts_code, refresh)
+    historical = bool(as_of)
 
     # ---- 取数（全字段年报三表 + 审计/质押/股东）----
-    ind = fetch_annual_full(client, "fina_indicator", ts_code, cfg.history_years, refresh)
-    income = fetch_annual_full(client, "income", ts_code, cfg.history_years, refresh)
-    balance = fetch_annual_full(client, "balancesheet", ts_code, cfg.history_years, refresh)
-    cashflow = fetch_annual_full(client, "cashflow", ts_code, cfg.history_years, refresh)
+    ind = fetch_annual_full(client, "fina_indicator", ts_code, cfg.history_years,
+                            refresh, end_date=as_of)
+    income = fetch_annual_full(client, "income", ts_code, cfg.history_years,
+                               refresh, end_date=as_of)
+    balance = fetch_annual_full(client, "balancesheet", ts_code, cfg.history_years,
+                                refresh, end_date=as_of)
+    cashflow = fetch_annual_full(client, "cashflow", ts_code, cfg.history_years,
+                                 refresh, end_date=as_of)
     try:
-        audit_rows = fetch_audit(client, ts_code, refresh)
+        audit_rows = fetch_audit(client, ts_code, refresh, end_date=as_of)
     except SqaDataError:
         audit_rows = []
-    pledge_ratio = fetch_pledge_ratio(client, ts_code, refresh)
-    holders = fetch_holder_ratio_series(client, ts_code, refresh=refresh)
-    try:
-        peers = fetch_peer_medians(client, basic.industry, refresh,
-                                   include_bad_debt=True)
-    except SqaDataError:
-        peers = None
+    if historical:
+        pledge_ratio = fetch_pledge_ratio(client, ts_code, refresh, as_of=as_of)
+        holders = fetch_holder_ratio_series(client, ts_code, refresh=refresh,
+                                            as_of=as_of)
+        try:
+            peers = fetch_peer_medians(client, basic.industry, refresh,
+                                       include_bad_debt=True, exclude_code=ts_code,
+                                       as_of=as_of)
+        except SqaDataError:
+            peers = None
+    else:
+        pledge_ratio = fetch_pledge_ratio(client, ts_code, refresh)
+        holders = fetch_holder_ratio_series(client, ts_code, refresh=refresh)
+        try:
+            peers = fetch_peer_medians(client, basic.industry, refresh,
+                                       include_bad_debt=True, exclude_code=ts_code)
+        except SqaDataError:
+            peers = None
 
     # ---- 序列准备（按年份对齐，缺口 None）----
     years = sorted(set(ind) | set(income) | set(balance) | set(cashflow))
@@ -83,7 +103,12 @@ def run_minesweeper(symbol: str, cfg: Thresholds | None = None,
     balance_rows = [balance[y] for y in sorted(balance)]
     income_latest = income_rows[-1] if income_rows else {}
     balance_latest = balance_rows[-1] if balance_rows else {}
-    fin_exp_latest = income_latest.get("fin_exp")
+    # 2.3 的"隐含利率"必须用利息支出（int_exp），不能用财务费用净额：
+    # 美的 fin_exp=-59 亿（利息净收入）会算出 9% 假高利率；int_exp 仅 27.5 万。
+    interest_exp_latest = income_latest.get("int_exp")
+    if interest_exp_latest is None:
+        fin_exp_latest = income_latest.get("fin_exp")
+        interest_exp_latest = fin_exp_latest if fin_exp_latest and fin_exp_latest > 0 else None
 
     holder_drop = (holders[-2] - holders[-1]) if len(holders) >= 2 else None
 
@@ -99,7 +124,7 @@ def run_minesweeper(symbol: str, cfg: Thresholds | None = None,
         fin.rule_1_6(income_rows),
         fin.rule_2_1(ocf, icf),
         fin.rule_2_2(ocf),
-        fin.rule_2_3(balance_latest, fin_exp_latest, cfg.ms_base_rate),
+        fin.rule_2_3(balance_latest, interest_exp_latest, cfg.ms_base_rate),
         fin.rule_3_1(ar, revenue),
         fin.rule_3_2(inv_turn, gm),
         fin.rule_3_3(cip, fix),
@@ -126,7 +151,7 @@ def run_minesweeper(symbol: str, cfg: Thresholds | None = None,
 
     # ---- 深度模式：年报 PDF 规则（按需；失败降级不阻断）----
     deep_info = None
-    if mode == "deep":
+    if mode == "deep" and not historical:
         from sqa.minesweeper.deep import run_deep
 
         rev_growth = None
@@ -171,4 +196,5 @@ def run_minesweeper(symbol: str, cfg: Thresholds | None = None,
         ],
         "source_version": SOURCE_VERSION,
         "deep": deep_info,
+        "as_of": as_of,
     }

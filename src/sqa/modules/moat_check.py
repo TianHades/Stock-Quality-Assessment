@@ -37,7 +37,7 @@ def run(ts_code: str, style: str, client: TushareClient,
         cfg: Thresholds, refresh: bool = False) -> dict:
     basic = fetch_basic(client, ts_code, refresh)
     ind = fetch_annual_full(client, "fina_indicator", ts_code, cfg.history_years, refresh)
-    peers = fetch_peer_medians(client, basic.industry, refresh)
+    peers = fetch_peer_medians(client, basic.industry, refresh, exclude_code=ts_code)
 
     years = sorted(ind)
     gm = C.series(ind, "grossprofit_margin", years)

@@ -19,14 +19,19 @@ from sqa.data.tushare_client import SqaDataError, TushareClient
 from sqa.quality.metrics import median
 
 MAX_PEERS = 60
+BAD_DEBT_PEER_LIMIT = 12   # 坏账对比样本：前 12 家，降低小样本中位数抖动
 CHUNK = 20
 
 
 def fetch_peer_medians(client: TushareClient, industry: str,
                        refresh: bool = False,
-                       include_bad_debt: bool = False) -> dict | None:
+                       include_bad_debt: bool = False,
+                       exclude_code: str = "",
+                       as_of: str | None = None) -> dict | None:
     """同行业年报中位数：毛利率/资产负债率/总资产周转率/应收周转率（+坏账计提）。
 
+    ``exclude_code`` 用于排除目标公司自身，避免"自己和自己比"。
+    ``as_of``（YYYYMMDD）用于历史时点：只取该日期前已公告的同行报表；
     ``include_bad_debt=True`` 时额外取同行 income(credit_impa_loss) +
     balancesheet(accounts_receiv) 计算坏账计提比例中位数，供排雷 3.5 使用；
     同行数据不足返回 None 或对应键为 None，调用方降级 SKIP。
@@ -34,33 +39,40 @@ def fetch_peer_medians(client: TushareClient, industry: str,
     if not industry:
         return None
     try:
-        peers = _industry_peers(client, industry, refresh)
+        peers = _industry_peers(client, industry, refresh, as_of=as_of)
+        if exclude_code:
+            peers = [code for code in peers if code != exclude_code]
         if len(peers) < 3:
             return None
         if len(peers) > MAX_PEERS:
-            peers = _top_by_mv(client, peers, refresh)
+            # 历史时点不能用当前市值挑同行（未来函数）；用代码序前 60 家，
+            # 当前分析仍按市值取前 60 家。
+            peers = peers[:MAX_PEERS] if as_of else _top_by_mv(client, peers, refresh)
 
         # 固定 year-1 在每年 1–4 月年报未披露时会取空；回退 year-2，并按
         # ts_code 去重后再算中位数（同一代码可能返回多条报告）。
+        base_year = int(as_of[:4]) if as_of else datetime.now().year
         period, by_code = "", {}
         for offset in (1, 2):
-            candidate = f"{datetime.now().year - offset}1231"
+            candidate = f"{base_year - offset}1231"
             rows_all: list[dict] = []
             for i in range(0, len(peers), CHUNK):
                 codes = ",".join(peers[i:i + CHUNK])
                 rows_all.extend(client.query(
                     "fina_indicator", refresh=refresh, ts_code=codes,
                     period=candidate,
-                    fields="ts_code,report_type,grossprofit_margin,debt_to_assets,"
-                           "assets_turn,ar_turn"))
-            if rows_all:
+                    fields="ts_code,ann_date,report_type,grossprofit_margin,"
+                           "debt_to_assets,assets_turn,ar_turn"))
+            for r in rows_all:
+                if r.get("report_type") not in (None, "1"):
+                    continue  # 只要合并报表口径
+                if as_of and str(r.get("ann_date") or "") > as_of:
+                    continue  # 历史时点：较晚公告的同行年报不纳入
+                code = str(r.get("ts_code") or "")
+                if code and code not in by_code:
+                    by_code[code] = r
+            if by_code:
                 period = candidate
-                for r in rows_all:
-                    if r.get("report_type") not in (None, "1"):
-                        continue  # 只要合并报表口径
-                    code = str(r.get("ts_code") or "")
-                    if code and code not in by_code:
-                        by_code[code] = r
                 break
         gms = [float(r["grossprofit_margin"]) for r in by_code.values()
                if r.get("grossprofit_margin") is not None]
@@ -77,37 +89,58 @@ def fetch_peer_medians(client: TushareClient, industry: str,
         return None
 
     bad_debt_ratio_median = None
+    bad_debt_ratio_agg = None
     n_bad_debt_peers = 0
     if include_bad_debt and period:
-        bad_ratios: list[float] = []
+        bad_pairs: list[tuple[float, float]] = []  # (信用减值损失, 应收账款)
         # income/balancesheet 不支持多 ts_code 批量查询，单票查询代价高；
-        # 坏账对比只取同行市值前 8 家，样本足够算中位数且控制冷启动耗时。
+        # 坏账对比只取同行前 12 家；历史时点按代码序，不用当前市值（避免未来函数）。
         try:
-            bad_peers = (peers if len(peers) <= 8
-                         else _top_by_mv(client, peers, refresh, limit=8))
+            bad_peers = (peers if len(peers) <= BAD_DEBT_PEER_LIMIT
+                         else (peers[:BAD_DEBT_PEER_LIMIT] if as_of
+                               else _top_by_mv(client, peers, refresh,
+                                               limit=BAD_DEBT_PEER_LIMIT)))
         except SqaDataError:
-            bad_peers = peers[:8]
+            bad_peers = peers[:BAD_DEBT_PEER_LIMIT]
         for code in bad_peers:
             try:
                 inc_rows = client.query(
                     "income", refresh=refresh, ts_code=code, period=period,
-                    fields="ts_code,report_type,credit_impa_loss")
+                    fields="ts_code,ann_date,report_type,credit_impa_loss")
                 bal_rows = client.query(
                     "balancesheet", refresh=refresh, ts_code=code, period=period,
-                    fields="ts_code,report_type,accounts_receiv,total_assets")
+                    fields="ts_code,ann_date,report_type,accounts_receiv,total_assets")
             except SqaDataError:
                 continue
+
+            def asof_ok(row: dict) -> bool:
+                return not as_of or str(row.get("ann_date") or "") <= as_of
+
             loss = next((abs(float(r["credit_impa_loss"])) for r in inc_rows
                          if r.get("report_type") in (None, "1")
+                         and asof_ok(r)
                          and r.get("credit_impa_loss") is not None), None)
             ar = next((float(r["accounts_receiv"]) for r in bal_rows
                        if r.get("report_type") in (None, "1")
+                       and asof_ok(r)
                        and r.get("accounts_receiv") is not None), None)
-            if loss is not None and ar and ar > 0:
-                bad_ratios.append(loss / ar * 100.0)
-        if len(bad_ratios) >= 3:
+            total_assets = next((float(r["total_assets"]) for r in bal_rows
+                                 if r.get("report_type") in (None, "1")
+                                 and asof_ok(r)
+                                 and r.get("total_assets") is not None), None)
+            # 与公司口径一致：只有应收账款具备重要性（≥总资产1%）的同行才入样，
+            # 避免应收极小公司把"计提/应收"比例放大成离群值。
+            if (loss is not None and ar and total_assets and total_assets > 0
+                    and ar / total_assets >= 0.01):
+                bad_pairs.append((loss, ar))
+        if bad_pairs:
+            bad_ratios = [loss / ar * 100.0 for loss, ar in bad_pairs]
+            n_bad_debt_peers = len(bad_pairs)
+            # 中位数保留作展示；规则使用"行业加权计提率"（总损失/总应收），
+            # 对行业中少数小应收/一次性计提造成的极端比例更稳健（C 步校准）。
             bad_debt_ratio_median = median(bad_ratios)
-            n_bad_debt_peers = len(bad_ratios)
+            bad_debt_ratio_agg = (sum(loss for loss, _ in bad_pairs)
+                                  / sum(ar for _, ar in bad_pairs) * 100.0)
 
     return {
         "gm_median": median(gms),
@@ -115,16 +148,23 @@ def fetch_peer_medians(client: TushareClient, industry: str,
         "assets_turn_median": median(assets_turns) if assets_turns else None,
         "ar_turn_median": median(ar_turns) if ar_turns else None,
         "bad_debt_ratio_median": bad_debt_ratio_median,
+        "bad_debt_ratio_agg": bad_debt_ratio_agg,
         "n_bad_debt_peers": n_bad_debt_peers,
         "n_peers": len(gms),
         "period": period,
     }
 
 
-def _industry_peers(client: TushareClient, industry: str, refresh: bool) -> list[str]:
+def _industry_peers(client: TushareClient, industry: str, refresh: bool,
+                    as_of: str | None = None) -> list[str]:
     basics = client.query("stock_basic", refresh=refresh, list_status="L",
-                          fields="ts_code,industry")
-    return [r["ts_code"] for r in basics if r.get("industry") == industry]
+                          fields="ts_code,industry,list_date")
+    rows = [r for r in basics if r.get("industry") == industry]
+    if as_of:
+        # 历史时点不能把形成日之后才上市的公司算作同行
+        rows = [r for r in rows
+                if str(r.get("list_date") or "") <= as_of]
+    return [r["ts_code"] for r in rows]
 
 
 def _top_by_mv(client: TushareClient, codes: list[str], refresh: bool,

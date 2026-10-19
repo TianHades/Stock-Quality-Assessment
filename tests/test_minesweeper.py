@@ -52,23 +52,47 @@ def test_rule_1_2_three_conditions_fail():
 
 # ---------- L2 ----------
 
+def test_rule_1_6_materiality_calibrated():
+    """D 步：减值 YoY 必须叠加利润占比材料性，避免小基数噪声 FAIL。"""
+    def inc(cur, prev, np_):
+        return [{"assets_impair_loss": prev, "credit_impa_loss": 0.0,
+                 "n_income_attr_p": np_},
+                {"assets_impair_loss": cur, "credit_impa_loss": 0.0,
+                 "n_income_attr_p": np_}]
+
+    # 0.3% 利润占比、YoY 200% → 噪声 PASS（旧规则会 FAIL）
+    assert fin.rule_1_6(inc(0.3, 0.1, 100.0)).verdict is MsVerdict.PASS
+    # 6% 利润占比、YoY 200% → 有实质影响 FAIL
+    assert fin.rule_1_6(inc(6.0, 2.0, 100.0)).verdict is MsVerdict.FAIL
+    # 6% 利润占比但 YoY 20% → WARN（占比高但未暴增）
+    assert fin.rule_1_6(inc(6.0, 5.0, 100.0)).verdict is MsVerdict.WARN
+    # 11% 利润占比、YoY 10% → FAIL（占比阈值 10%）
+    assert fin.rule_1_6(inc(11.0, 10.0, 100.0)).verdict is MsVerdict.FAIL
+
+
 def test_rule_2_3_high_cash_high_rate_debt_fails():
     balance = {"money_cap": 200.0, "st_borr": 100.0, "lt_borr": 50.0, "bond_payable": 0.0}
-    assert fin.rule_2_3(balance, fin_exp=-12.0, base_rate=3.5).verdict is MsVerdict.FAIL
+    assert fin.rule_2_3(balance, interest_exp=12.0, base_rate=3.5).verdict is MsVerdict.FAIL
     # 现金少于有息负债一半 → PASS（利率正常）
     ok = {"money_cap": 30.0, "st_borr": 100.0, "lt_borr": 0.0, "bond_payable": 0.0}
-    assert fin.rule_2_3(ok, fin_exp=-4.0, base_rate=3.5).verdict is MsVerdict.PASS
+    assert fin.rule_2_3(ok, interest_exp=4.0, base_rate=3.5).verdict is MsVerdict.PASS
+
+
+def test_rule_2_3_uses_interest_exp_not_net_finance():
+    # 美的式：净财务费用为负（利息收入），但利息支出很小 → PASS
+    balance = {"money_cap": 200.0, "st_borr": 100.0, "total_assets": 1000.0}
+    assert fin.rule_2_3(balance, interest_exp=2.0, base_rate=3.5).verdict is MsVerdict.PASS
 
 
 def test_rule_2_3_zero_or_immaterial_debt_is_pass_not_skip():
     # 无有息负债：存贷双高不适用 → PASS（此前会 SKIP）
     no_debt = {"money_cap": 1000.0, "total_assets": 5000.0}
-    result = fin.rule_2_3(no_debt, fin_exp=None, base_rate=3.5)
+    result = fin.rule_2_3(no_debt, interest_exp=None, base_rate=3.5)
     assert result.verdict is MsVerdict.PASS
     # 有息负债占总资产 <1%（茅台式）：财务费用净收入/极少借款不触发 FAIL
     tiny = {"money_cap": 5000.0, "non_cur_liab_due_1y": 4.0,
             "total_assets": 100000.0}
-    result = fin.rule_2_3(tiny, fin_exp=-800.0, base_rate=3.5)
+    result = fin.rule_2_3(tiny, interest_exp=8.0, base_rate=3.5)
     assert result.verdict is MsVerdict.PASS
 
 
@@ -105,14 +129,16 @@ def test_rule_s1_pledge_thresholds():
 
 
 def test_rule_5_8_tiny_base_exemption():
-    # 占比 0.3% 基数上 YoY 55% → 最多 WARN（双汇误报案例）
+    # 占比 0.3% / 0.8% 基数上 YoY 高增 → 最多 WARN（C 步把 FAIL 门槛提到 1%）
     def bal(oth, oth_prev):
         return [{"oth_receiv": oth_prev, "total_assets": 1000.0},
                 {"oth_receiv": oth, "total_assets": 1000.0}]
     r = nonfin.rule_5_8(bal(3.1, 2.0), [1000.0, 1000.0])   # 0.31%，YoY 55%
     assert r.verdict is MsVerdict.WARN
     r2 = nonfin.rule_5_8(bal(8.0, 5.0), [1000.0, 1000.0])  # 0.8% 且 YoY 60%
-    assert r2.verdict is MsVerdict.FAIL                     # 非小额则 FAIL 保留
+    assert r2.verdict is MsVerdict.WARN                     # <1% 仍不 FAIL
+    r2b = nonfin.rule_5_8(bal(12.0, 7.0), [1000.0, 1000.0])  # 1.2% 且 YoY 71%
+    assert r2b.verdict is MsVerdict.FAIL                     # ≥1% 且高增 → FAIL
     r3 = nonfin.rule_5_8(bal(60.0, 40.0), [1000.0, 1000.0])  # 6% 占比直接 FAIL
     assert r3.verdict is MsVerdict.FAIL
 
@@ -147,6 +173,35 @@ def test_rule_5_1_agency_name_normalization():
         {"audit_agency": "立信"},
     ]
     assert nonfin.rule_5_1(rows).verdict is MsVerdict.PASS  # 同一所不同写法
+
+    # D 步：有限公司/地区括号变体也不得误计为换所
+    variants = [
+        {"audit_agency": "德勤华永"},
+        {"audit_agency": "德勤华永事务所有限公司"},
+        {"audit_agency": "四川华信(集团)"},
+        {"audit_agency": "四川华信(集团)会计师事务有限责任公司"},
+        {"audit_agency": "四川华信(集团)事务所有限责任公司"},
+    ]
+    by_name = {"德勤华永": variants[:2], "四川华信(集团)": variants[2:]}
+    for name, rows in by_name.items():
+        assert nonfin.rule_5_1(rows).verdict is MsVerdict.PASS
+
+
+def test_rule_5_1_uses_recent_5_year_window():
+    # 2016-2018 A、2019-2023 B、2024-2025 C：
+    # 最近 5 年（2021-2025）只看到 B→C 一次 → WARN，而不是 10 年窗口的 FAIL
+    rows = []
+    for year in range(2016, 2026):
+        agency = "A所" if year <= 2018 else ("B所" if year <= 2023 else "C所")
+        rows.append({"end_date": f"{year}1231", "audit_agency": agency})
+    assert nonfin.rule_5_1(rows).verdict is MsVerdict.WARN
+    # 最近 5 年 A→B→A 两次切换 → FAIL
+    recent = [{"end_date": "20211231", "audit_agency": "A所"},
+              {"end_date": "20221231", "audit_agency": "A所"},
+              {"end_date": "20231231", "audit_agency": "B所"},
+              {"end_date": "20241231", "audit_agency": "A所"},
+              {"end_date": "20251231", "audit_agency": "A所"}]
+    assert nonfin.rule_5_1(recent).verdict is MsVerdict.FAIL
 
 
 # ---------- 计分与闸门 ----------

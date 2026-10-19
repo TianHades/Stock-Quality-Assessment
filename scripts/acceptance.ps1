@@ -37,6 +37,11 @@ try {
         Invoke-Step "force smoke" {
             python -m sqa.cli analyze 000725 --force --json | Out-Null
         }
+        Invoke-Step "live snapshots" {
+            $env:SQA_INTEGRATION = "1"
+            python -m pytest -q tests/test_live_snapshots.py
+            Remove-Item Env:SQA_INTEGRATION -ErrorAction SilentlyContinue
+        }
     }
 
     Write-Host ""

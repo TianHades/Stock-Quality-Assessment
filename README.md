@@ -26,8 +26,9 @@ PDF 获取/解析失败时自动降级为快筛结果并记录原因（不会中
 
 ```bash
 pytest                                    # 离线单元测试（规则纯函数 + 深度模式抽取/判定）
-SQA_INTEGRATION=1 pytest tests/test_golden_set.py   # 集成：真实数据金标准
-python -m sqa.cli golden                  # 金标准 13/13（需 TUSHARE_TOKEN / .env）
+SQA_INTEGRATION=1 pytest tests/test_golden_set.py tests/test_live_snapshots.py
+                                          # 集成：金标准 + 风险/质量/估值快照
+python -m sqa.cli golden                  # 金标准 18/18（需 TUSHARE_TOKEN / .env）
 ```
 
 一键验收（Windows PowerShell 5.1 / 7）：
@@ -35,7 +36,7 @@ python -m sqa.cli golden                  # 金标准 13/13（需 TUSHARE_TOKEN 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -Offline  # 离线
 powershell -ExecutionPolicy Bypass -File scripts/acceptance.ps1            # 额外 golden
-powershell -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -Full      # 额外深度/force smoke
+powershell -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -Full      # 额外深度/force/快照
 # PowerShell 7 可直接：pwsh -File scripts/acceptance.ps1 -Full
 ```
 
@@ -48,6 +49,19 @@ CI 见 `.github/workflows/ci.yml`：push/PR 跑离线测试、ruff、compileall�
   字段口径升级会自然生成新缓存；深度模式 PDF 文本缓存可整体删除后重取；
 - **旧报告**：`python scripts/archive_reports.py --dry-run` 预览，默认把
   `reports/analyze_*.json` 中早于当天的报告移入 `reports/archive_pre_<日期>/`；
+- **扩样回测**：`python scripts/backtest_thresholds.py`（股票池
+  `config/backtest_universe.txt`，30 只）；生成 100 只分层样本：
+  `python scripts/build_backtest_universe.py`，再
+  `python scripts/backtest_thresholds.py --universe config/backtest_universe_100.txt --label d_backtest100`；
+  输出 `reports/d_backtest*_<日期>.json/.md`；需要 token，首次运行因同行单票查询较慢；
+- **历史标签回测**：`python scripts/f_labels_backtest.py`（形成日 2023-04-30，
+  1y/2y 复权收益 + ST 名称标签；历史快照跳过当前快照类规则）；
+- **G 步多形成日/退市标签**：`python scripts/build_historical_universe.py
+  --size 200 --delisted 60 --out config/backtest_universe_hist200.txt`
+  生成含后来退市/ST 的 200 只股票池，再
+  `python scripts/g_labels_backtest.py --universe config/backtest_universe_hist200.txt
+  --formations 20210430,20230430`（1y/2y 收益 + ST/退市/非标审计标签；
+  历史质押/股东/同行数据已补齐）；
 - **首次建仓（手动）**：`git init` → 检查 `git status`（不应出现 `.env` / `data_cache/` /
   `reports/` / `*.pdf`）→ `git add .` → `git commit -m "sqa v0.1.0 baseline"` →
   `git tag v0.1.0`。
@@ -95,7 +109,7 @@ Claude Code Skill 实现）。2026-10-18 已将其规则全文、原书依据、
 - CAGR 统一为近 3 年（4 个年度点，任一点缺失降级 SKIP）；非周期盈利指标取 3 年均值，
   周期股取 10 年中位数；
 - 金额单位元；股息率 %；PE/PB 分位为近 5 年时序分位；
-- 同行锚点：同行业年报中位数（质量评分取前 60 家；排雷 3.5 坏账取前 8 家，
-  单票查询并缓存）；
+- 同行锚点：同行业年报中位数（质量评分取前 60 家；排雷 3.5 用前 12 家、
+  应收≥总资产1% 同行的加权坏账计提率，单票查询并缓存）；
 - 数据缺失一律降级 SKIP 并在 evidence 中标注，绝不猜测补数；
 - 深度模式的证据片段（页码+原文）随报告一并输出，供人工复核。

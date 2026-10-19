@@ -81,7 +81,7 @@ def run_quality(symbol: str, style: str, badges: tuple | list = (),
     divs = fetch_dividend_records(client, ts_code, refresh)
     pledge = fetch_pledge_ratio(client, ts_code, refresh)
     holders = fetch_holder_ratio_series(client, ts_code, refresh=refresh)
-    peers = fetch_peer_medians(client, basic.industry, refresh)
+    peers = fetch_peer_medians(client, basic.industry, refresh, exclude_code=ts_code)
 
     years = sorted(set(ind) | set(income) | set(balance) | set(cashflow))
 

@@ -43,3 +43,8 @@ jobs:
         env:
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
         run: python -m sqa.cli golden
+      - name: live snapshots
+        env:
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          SQA_INTEGRATION: "1"
+        run: python -m pytest -q tests/test_live_snapshots.py

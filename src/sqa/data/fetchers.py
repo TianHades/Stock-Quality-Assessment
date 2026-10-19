@@ -29,6 +29,11 @@ def fetch_basic(client: TushareClient, ts_code: str, refresh: bool = False) -> S
     rows = client.query("stock_basic", refresh=refresh, ts_code=ts_code,
                         fields="ts_code,symbol,name,industry,list_date")
     if not rows:
+        # 历史回测会碰到已退市代码：stock_basic 默认只查 L，需回退 D
+        rows = client.query("stock_basic", refresh=refresh, ts_code=ts_code,
+                            list_status="D",
+                            fields="ts_code,symbol,name,industry,list_date,delist_date")
+    if not rows:
         raise SqaDataError(f"stock_basic 无记录: {ts_code}")
     r = rows[0]
     return StockBasic(

@@ -1,6 +1,8 @@
 """排雷规则 L0/L5/L6/S：门槛审计 / 非财务信号 / 行业特有 / 本系统补充。"""
 from __future__ import annotations
 
+import re
+
 from sqa.minesweeper.models import MsResult, MsVerdict
 
 # 农林牧渔高风险行业关键词（上游 L6.1；注意排除已在本系统范围外的医药）
@@ -55,24 +57,34 @@ def rule_0_2(audit_rows: list[dict]) -> MsResult:
 def _normalize_agency(name: str) -> str:
     """审计所名称归一化：同一事务所的不同写法不应计为换所。
 
-    处理：全角括号→半角、去空白、去"（特殊普通合伙）"后缀、
-    "会计师事务所"/"事务所"后缀统一（同一所常有 6 种变体——金标准教训）。
+    2026-10-19 D 步强化：去括号内容（特殊普通合伙/地区分所）、去
+    "事务所/有限公司/有限责任/股份"等后缀，循环剥离直到稳定；
+    解决"德勤华永" vs "德勤华永事务所有限公司"、"四川华信(集团)"
+    vs "四川华信(集团)会计师事务有限责任公司"被误计为换所。
     """
     s = name.replace("（", "(").replace("）", ")")
-    s = s.replace("(特殊普通合伙)", "").replace("特殊普通合伙", "")
-    s = s.replace("会计师事务所", "事务所")
-    if s.endswith("事务所"):
-        s = s[:-3]
+    s = re.sub(r"\([^)]*\)", "", s)  # 去括号内特殊合伙/地区等说明
+    s = s.replace("会计师事务所", "事务所").replace("审计事务所", "事务所")
+    changed = True
+    while changed:
+        changed = False
+        for suffix in ("有限责任公司", "股份有限公司", "有限公司",
+                       "事务所", "会计师事务", "会计事务",
+                       "特殊普通合伙", "普通合伙"):
+            if s.endswith(suffix):
+                s = s[:-len(suffix)]
+                changed = True
     return "".join(s.split())
 
 
-# 换所检测只看最近 10 个年报：全历史窗口会让几乎所有老公司都触发 FAIL
-# （事务所行业并购改名潮 + 正常轮换），规则退化为噪声（茅台案例校准）
-_AGENCY_WINDOW = 10
+# 换所检测只看最近 5 个年报（2026-10-19 D 步校准）：
+# 10 年窗口会把正常轮换/事务所并购史算成多次换所（茅台 2018/2024 两次）；
+# 5 年窗口保留“近期频繁换所”风险（长电 2022/2025 仍 FAIL）。
+_AGENCY_WINDOW = 5
 
 
 def rule_5_1(audit_rows: list[dict]) -> MsResult:
-    """更换审计机构（名称归一化后比较，限最近 10 个年报）。"""
+    """更换审计机构（名称归一化后比较，限最近 5 个年报）。"""
     recent = audit_rows[-_AGENCY_WINDOW:]
     agencies = []
     for r in recent:
@@ -141,9 +153,9 @@ def rule_5_7(balance_latest: dict) -> MsResult:
 def rule_5_8(balance: list[dict], total_assets: list[float | None]) -> MsResult:
     """其他应收款异常（关联方资金占用藏身之处）。
 
-    小额豁免（对齐上游 3.4 的"金额极小"先例）：占比 ≤0.5% 时无论增速
-    最多 WARN——0.3% 的基数上 YoY 55% 属噪声，不构成 FAIL 证据
-    （金标准教训：双汇误报）。
+    小额豁免：占比 ≤0.5% 最多 WARN；0.5–1.0% 即使 YoY 高增也只给 WARN，
+    ≥1.0% 且 YoY>50% 才 FAIL（2026-10-19 C 步校准：0.5% 边界会把噪声
+    放大成 FAIL，例如美的 0.5%/YoY54% 的实际样本）。
     """
     if len(balance) < 2:
         return MsResult("5.8", "L5", MsVerdict.SKIP, "资产负债表年度数据不足")
@@ -156,7 +168,7 @@ def rule_5_8(balance: list[dict], total_assets: list[float | None]) -> MsResult:
     ratio = oth / ta * 100
     yoy = oth / oth_prev - 1.0 if oth_prev > 0 else None
     yoy_str = yoy if yoy is None else f"{yoy:.0%}"
-    if ratio > 5 or (yoy is not None and yoy > 0.5 and ratio > 0.5):
+    if ratio > 5 or (yoy is not None and yoy > 0.5 and ratio > 1.0):
         return MsResult("5.8", "L5", MsVerdict.FAIL,
                         f"其他应收款/总资产 {ratio:.1f}%，YoY {yoy_str}")
     if ratio > 3 or (yoy is not None and yoy > 0.3):

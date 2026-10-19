@@ -118,7 +118,15 @@ def rule_1_5(income: list[dict]) -> MsResult:
 
 
 def rule_1_6(income: list[dict]) -> MsResult:
-    """资产/信用减值损失暴增。"""
+    """资产/信用减值损失暴增。
+
+    2026-10-19 D 步校准（30 只样本）：
+    - 上游 5% 利润占比阈值过严：23/30 触发 FAIL，含五粮液/泸州老窖等
+      减值仅占利润 0.3-0.4% 的公司（基数小导致 YoY 巨大）；
+    - FAIL：减值占利润 >10%，或 YoY>100% 且占利润 >5%（有实质利润影响）；
+    - WARN：占利润 5-10%，或 YoY>50% 且占利润 >1%；
+    - 占利润 <1% 的 YoY 波动视为噪声，PASS。
+    """
     if len(income) < 2:
         return MsResult("1.6", "L1", MsVerdict.SKIP, "利润表年度数据不足")
 
@@ -136,13 +144,24 @@ def rule_1_6(income: list[dict]) -> MsResult:
 
     yoy = cur / prev - 1.0 if prev > 0 else None
     to_profit = cur / abs(np_cur) * 100 if np_cur else None
+    yoy_txt = yoy if yoy is None else f"{yoy:.0%}"
+    profit_txt = to_profit if to_profit is None else f"{to_profit:.1f}%"
 
-    if (yoy is not None and yoy > 1.0) or (to_profit is not None and to_profit > 5):
+    if to_profit is None:
+        if yoy is not None and yoy > 1.0:
+            return MsResult("1.6", "L1", MsVerdict.FAIL, f"减值 YoY {yoy_txt}")
+        if yoy is not None and yoy > 0.5:
+            return MsResult("1.6", "L1", MsVerdict.WARN, f"减值 YoY {yoy_txt}")
+        return MsResult("1.6", "L1", MsVerdict.PASS, f"减值 YoY {yoy_txt}")
+
+    if to_profit > 10 or (yoy is not None and yoy > 1.0 and to_profit > 5):
         return MsResult("1.6", "L1", MsVerdict.FAIL,
-                        f"减值 YoY {yoy if yoy is None else f'{yoy:.0%}'}，占利润 {to_profit if to_profit is None else f'{to_profit:.1f}%'}")
-    if yoy is not None and yoy > 0.5:
-        return MsResult("1.6", "L1", MsVerdict.WARN, f"减值 YoY {yoy:.0%}")
-    return MsResult("1.6", "L1", MsVerdict.PASS, f"减值 YoY {yoy if yoy is None else f'{yoy:.0%}'}")
+                        f"减值 YoY {yoy_txt}，占利润 {profit_txt}")
+    if to_profit > 5 or (yoy is not None and yoy > 0.5 and to_profit > 1):
+        return MsResult("1.6", "L1", MsVerdict.WARN,
+                        f"减值 YoY {yoy_txt}，占利润 {profit_txt}")
+    return MsResult("1.6", "L1", MsVerdict.PASS,
+                    f"减值 YoY {yoy_txt}，占利润 {profit_txt}")
 
 
 # ---------- Layer 2: 现金流信号 ----------
@@ -184,11 +203,14 @@ def rule_2_2(ocf: list[float | None]) -> MsResult:
     return MsResult("2.2", "L2", MsVerdict.PASS, f"近5年 {neg} 年经营CF为负")
 
 
-def rule_2_3(balance_latest: dict, fin_exp: float | None, base_rate: float) -> MsResult:
+def rule_2_3(balance_latest: dict, interest_exp: float | None, base_rate: float) -> MsResult:
     """高现金 + 高息借债（存贷双高，经典造假信号）。
 
-    2026-10 验收修正：有息负债为 0/占总资产 <1% 时直接 PASS（存贷双高不适用），
-    不再因财务费用字段或低负债而 SKIP；有息负债补入一年内到期非流动负债。
+    2026-10 验收/D 步修正：
+    - 隐含利率用 **利息支出 int_exp**，不是财务费用净额 fin_exp（后者含利息收入，
+      美的 fin_exp=-59 亿会算出 9% 假高利率；int_exp 仅 27.5 万）；
+    - 有息负债为 0/占总资产 <1% 时直接 PASS，不再因字段或低负债 SKIP；
+    - 有息负债补入一年内到期非流动负债。
     """
     cash = _f(balance_latest, "money_cap")
     if cash is None:
@@ -201,10 +223,10 @@ def rule_2_3(balance_latest: dict, fin_exp: float | None, base_rate: float) -> M
     if total_assets and total_assets > 0 and ibd / total_assets < 0.01:
         return MsResult("2.3", "L2", MsVerdict.PASS,
                         f"有息负债/总资产仅 {ibd / total_assets:.2%}，存贷双高不适用")
-    if fin_exp is None:
-        return MsResult("2.3", "L2", MsVerdict.SKIP, "有息负债存在但财务费用字段缺失")
+    if interest_exp is None:
+        return MsResult("2.3", "L2", MsVerdict.SKIP, "有息负债存在但利息支出字段缺失")
 
-    implied = abs(fin_exp) / ibd * 100
+    implied = abs(interest_exp) / ibd * 100
     if cash > ibd and implied > base_rate + 4:
         return MsResult("2.3", "L2", MsVerdict.FAIL,
                         f"存贷双高: 现金>有息负债且隐含利率 {implied:.1f}%（基准 {base_rate}%+4pp）")
@@ -310,9 +332,10 @@ def rule_3_5(income_latest: dict, balance_latest: dict,
     """坏账计提比例低于同行（3.5，2026-10-19 实现）。
 
     公司口径：|信用减值损失| / 应收账款 ×100；同行口径用同行业年报的
-    income.credit_impa_loss + balancesheet.accounts_receiv 中位数。
-    应收账款极小（<总资产1%）或同行样本不足 → SKIP；低于同行中位数→WARN，
-    低于中位数 50%→FAIL（上游规则）。
+    income.credit_impa_loss + balancesheet.accounts_receiv 计算
+    **加权计提率**（总损失/总应收，C 步校准：比小样本中位数更稳健）。
+    应收账款极小（<总资产1%）或同行样本不足 → SKIP；低于同行→WARN，
+    低于同行 50%→FAIL（上游规则）。
     """
     ar = _f(balance_latest, "accounts_receiv")
     loss = _f(income_latest, "credit_impa_loss")
@@ -323,7 +346,9 @@ def rule_3_5(income_latest: dict, balance_latest: dict,
     if total_assets and total_assets > 0 and ar / total_assets < 0.01:
         return MsResult("3.5", "L3", MsVerdict.SKIP,
                         f"应收账款占总资产仅 {ar / total_assets:.2%}，坏账比例不具可比性")
-    peer_median = (peers or {}).get("bad_debt_ratio_median")
+    peer_median = (peers or {}).get("bad_debt_ratio_agg")
+    if peer_median is None:
+        peer_median = (peers or {}).get("bad_debt_ratio_median")
     n_peers = (peers or {}).get("n_bad_debt_peers") or 0
     if peer_median is None or n_peers < 3:
         return MsResult("3.5", "L3", MsVerdict.SKIP,
@@ -333,7 +358,7 @@ def rule_3_5(income_latest: dict, balance_latest: dict,
                         "同行坏账计提比例中位数为 0，比较无意义")
 
     ratio = abs(loss) / ar * 100.0
-    detail = f"坏账计提比例 {ratio:.2f}% vs 同行中位数 {peer_median:.2f}%"
+    detail = f"坏账计提比例 {ratio:.2f}% vs 同行加权 {peer_median:.2f}%"
     if ratio < peer_median * 0.5:
         return MsResult("3.5", "L3", MsVerdict.FAIL, detail + "（低于同行 50%）")
     if ratio < peer_median:
