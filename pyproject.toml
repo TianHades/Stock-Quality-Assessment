@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sqa"
+version = "0.1.0"
+description = "A股股票质地分析：分类判定 → 排雷 → 质量评分 → 估值"
+requires-python = ">=3.10"
+dependencies = [
+    "tushare>=1.4.0",
+    "pandas>=2.0",
+    "PyYAML>=6.0",
+    "python-dotenv>=1.0",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.5"]
+pdf = ["pypdf>=4.0"]   # 深度模式 PDF 文本抽取（有 pdftotext 时可不用）
+
+[project.scripts]
+sqa = "sqa.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: 需要网络与 TUSHARE_TOKEN 的集成测试（默认跳过，用 SQA_INTEGRATION=1 开启）",
+]

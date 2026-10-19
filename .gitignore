@@ -1,0 +1,22 @@
+# 密钥
+.env
+
+# 数据与产物
+data_cache/
+reports/
+*.pdf
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+.venv/
+.coverage
+
+# 本地工具/IDE
+.mcp.json
+.DS_Store

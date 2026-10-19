@@ -1,0 +1,32 @@
+# 分类判定阈值（默认值）—— 与 docs/01-category-classification.md 5.0 节一一对应
+# 所有阈值集中于此，禁止在代码中硬编码。跑数校准后回写本文档并同步更新 01 号文档。
+
+cycle:
+  gm_range_pp: 10.0            # CYCLE_GM_RANGE   近10年毛利率最大极差（百分点）
+  np_drawdown: 0.5             # CYCLE_NP_DRAWDOWN 归母净利润最大回撤（先峰后谷）
+
+dividend:
+  yield_floor: 3.0             # DIV_YIELD_FLOOR  股息率静态下限（%）
+  yield_rf_spread_pp: 1.5      # DIV_YIELD_RISK_FREE_SPREAD 相对10Y国债动态溢价（pp）
+  consecutive_years: 5         # DIV_CONSECUTIVE_YEARS
+  payout_min: 0.25             # DIV_PAYOUT_MIN
+  payout_warn: 0.90            # DIV_PAYOUT_WARN
+  fcf_cover_max: 1.0           # DIV_FCF_COVER_MAX 累计分红/累计FCF 上限
+
+style:
+  growth_rev_cagr: 0.15        # GROWTH_REV_CAGR
+  growth_np_cagr: 0.20         # GROWTH_NP_CAGR（扣非口径）
+  value_pctl: 0.30             # VALUE_PCTL PE/PB 近5年分位门槛
+  value_rev_cagr_max: 0.10     # VALUE_REV_CAGR_MAX
+  val_pctl_window_years: 5     # VAL_PCTL_WINDOW
+
+data:
+  history_years: 10            # 财务历史回看窗口
+  min_years_for_quant: 5       # R2 量化判定的最少年数
+
+minesweeper:
+  # 简写键名会被 config.load_thresholds 映射到 ms_* 字段
+  base_rate: 3.5               # 隐含借款利率基准（%，L2.3 用，参考 LPR）
+  gate_extreme: 46             # 极高风险出局线（不可 --force）
+  gate_high: 26                # 高风险出局线（可 --force）
+  gate_mid: 11                 # 中风险降档线
