@@ -63,7 +63,7 @@
 
 ### 文档与验收
 
-- 验收快照：`reports/acceptance_20261019.md`（B 前）；
-- B 步报告：`reports/b-step-peer-pipeline_20261019.md`；
+- 验收快照与 A–G 步过程报告（`reports/*.md`、`reports/*.json`）为本地运行产物，
+  按 `.gitignore` 不入库，纯源码版不包含；结论已内联到 `docs/01` §8 校准记录；
 - 一键验收：`scripts/acceptance.ps1`（默认含 golden；`-Offline` 仅离线）；
 - CI：`.github/workflows/ci.yml`。

@@ -91,6 +91,9 @@ data_cache/           API 缓存 + 年报 PDF/文本缓存（可整目录删除�
 reports/              运行结果
 ```
 
+本仓库为**纯源码版**：`data_cache/`、`reports/`、`.env`、PDF 与各类缓存均为运行时产物，
+按 `.gitignore` 不入库、第一次运行时自动生成；仓库内不保留历史运行结果与过程报告。
+
 ## 规则来源
 
 排雷规则源自兄弟项目 `financial-report-minesweeper`（唐朝《手把手教你读财报》方法论的
