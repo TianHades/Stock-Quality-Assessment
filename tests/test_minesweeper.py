@@ -104,6 +104,20 @@ def test_rule_3_2_inventory_turn_down_gm_up_combo():
     assert fin.rule_3_2([2.0, 1.5], [20.0, 24.0]).verdict is MsVerdict.FAIL
 
 
+# ---------- L2 资本开支 ----------
+
+def test_rule_2_1_uses_capex_not_total_investment_cf():
+    # 2026-10-25 复核修正：理财型投资现金流不得计入"扩张烧钱"
+    ocf = [10.0] * 6
+    capex = [9.0, 9.0, 9.0, 9.0, 2.0, 2.0]
+    assert fin.rule_2_1(ocf, capex).verdict is MsVerdict.FAIL   # 4 年命中
+    assert fin.rule_2_1([10.0] * 4, [9.0, 9.0, 2.0, 2.0]).verdict is MsVerdict.WARN
+    assert fin.rule_2_1([10.0] * 4, [2.0] * 4).verdict is MsVerdict.PASS
+    # capex 全缺 / 有效配对 <3 年 → SKIP（不猜测）
+    assert fin.rule_2_1([10.0] * 4, [None] * 4).verdict is MsVerdict.SKIP
+    assert fin.rule_2_1([10.0] * 4, [9.0]).verdict is MsVerdict.SKIP
+
+
 # ---------- L4 ----------
 
 def test_rule_4_1_consecutive_below_one_fails():
@@ -111,6 +125,63 @@ def test_rule_4_1_consecutive_below_one_fails():
     np_ = [100.0, 100.0, 100.0, 100.0, 100.0]
     assert fin.rule_4_1(ocf, np_).verdict is MsVerdict.FAIL
     assert fin.rule_4_1([100.0] * 5, np_).verdict is MsVerdict.PASS
+
+
+def test_rule_4_1_uses_recent_5_year_window():
+    # 历史 6 年 <1，但近 5 年只有 3 年 <1（最长连续 2 年）→ WARN 而非 FAIL
+    ocf = [50.0] * 6 + [160.0, 99.0, 79.0, 165.0]
+    np_ = [100.0] * 10
+    result = fin.rule_4_1(ocf, np_)
+    assert result.verdict is MsVerdict.WARN
+    assert "历史最长连续" in result.detail
+    # 近 5 年连续 3 年 <1 → FAIL
+    recent_fail = [100.0, 100.0, 100.0, 100.0, 100.0, 100.0,
+                   100.0, 50.0, 50.0, 50.0]
+    assert fin.rule_4_1(recent_fail, np_).verdict is MsVerdict.FAIL
+
+
+def test_rule_4_1_window_is_calendar_years_not_valid_points():
+    # 最近 5 个年度中 4 年亏损：亏损年按"CF/净利<1"命中计（不得 SKIP/PASS）
+    ocf = [200.0] * 6 + [50.0, 50.0, 50.0, 50.0]
+    np_ = [100.0] * 6 + [-10.0, -10.0, -10.0, -10.0]
+    assert fin.rule_4_1(ocf, np_).verdict is MsVerdict.FAIL
+
+
+def test_rule_4_1_loss_years_count_as_hits():
+    # 近 5 年 3 年命中（含 1 年亏损、2 年低比值）但无连续 3 年 → WARN
+    ocf = [150.0, 150.0, 150.0, 150.0, 150.0,
+           150.0, 50.0, 150.0, 50.0, 50.0]
+    np_ = [100.0] * 10
+    np_[6] = -10.0  # 亏损年（负比值 <1）
+    result = fin.rule_4_1(ocf, np_)
+    assert result.verdict is MsVerdict.WARN
+    # 最近 5 年数据全缺失 → SKIP（不得 PASS）
+    assert fin.rule_4_1([50.0] * 5, [None] * 5).verdict is MsVerdict.SKIP
+
+
+def test_rule_4_5_uses_recent_5_year_window():
+    np_ = [float(i) for i in range(1, 11)]  # 逐年增长
+    # 历史 4 年命中 + 近 5 年 2 年命中 → WARN（旧口径 6 年 → FAIL）
+    fcf = [-1.0, -1.0, -1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0]
+    result = fin.rule_4_5(np_, fcf)
+    assert result.verdict is MsVerdict.WARN
+    assert "历史" in result.detail
+    # 近 5 年 3 年命中 → FAIL
+    fcf_fail = [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0]
+    assert fin.rule_4_5(np_, fcf_fail).verdict is MsVerdict.FAIL
+    # 近 5 年 0-1 年命中 → PASS
+    assert fin.rule_4_5(np_, [1.0] * 10).verdict is MsVerdict.PASS
+    # FCF 全缺失 → SKIP
+    assert fin.rule_4_5(np_, [None] * 10).verdict is MsVerdict.SKIP
+    # 最近 5 个年度数据全缺失 → SKIP（不得回退到更早命中）
+    assert fin.rule_4_5(np_, [-1.0] * 5 + [None] * 5).verdict is MsVerdict.SKIP
+    # 近 5 年有效数据 <3 → SKIP（不得 PASS）
+    assert fin.rule_4_5([1.0, 2.0, 3.0, 4.0, 5.0],
+                        [None] * 4 + [-1.0]).verdict is MsVerdict.SKIP
+    # np_/fcf 长度不一致：按公共年份对齐，不越界/错位
+    misaligned = fin.rule_4_5([float(i) for i in range(1, 11)],
+                              [-1.0] * 5 + [None] * 4 + [-1.0] + [-1.0])
+    assert misaligned.verdict is MsVerdict.SKIP
 
 
 # ---------- L5 / S ----------
@@ -153,16 +224,32 @@ def test_rule_s2_short_term_coverage():
 
 # ---------- 4.4 / 5.1（茅台实跑校准的回归用例） ----------
 
-def test_rule_4_4_must_subtract_business_tax():
-    # 真实字段口径：biz_tax_surchg（税金及附加）+ n_income（总净利，少数股东前）
-    row = {"revenue": 1500.0, "oper_cost": 100.0, "biz_tax_surchg": 180.0,
-           "sell_exp": 50.0, "admin_exp": 60.0, "fin_exp": -130.0,
-           "n_income": 1000.0, "n_income_attr_p": 750.0}
-    r = fin.rule_4_4(row)
-    assert r.verdict in (MsVerdict.PASS, MsVerdict.WARN, MsVerdict.FAIL)
-    # 缺税金字段 → SKIP（宁缺毋滥）
-    no_tax = dict(row); no_tax.pop("biz_tax_surchg")
+def test_rule_4_4_must_subtract_business_tax_and_rd():
+    # 真实字段口径：biz_tax_surchg（税金及附加）+ rd_exp（研发费用）
+    # 2026-10-25 复核：比较基准改为营业利润（税前口径），避免所得税造成的假背离
+    base = {"revenue": 1500.0, "oper_cost": 100.0, "biz_tax_surchg": 180.0,
+            "sell_exp": 50.0, "admin_exp": 60.0, "fin_exp": -130.0,
+            "rd_exp": 0.0, "operate_profit": 1000.0}
+    # rd=0 时 core=1240 → 与营业利润背离 24% → WARN
+    assert fin.rule_4_4(dict(base)).verdict is MsVerdict.WARN
+    # 扣减研发费用 240 后 core=1000 → 背离 0% → PASS（2026-10-25 复核修正）
+    with_rd = dict(base, rd_exp=240.0)
+    assert fin.rule_4_4(with_rd).verdict is MsVerdict.PASS
+    # 营业利润缺失回退利润总额（同为税前口径）；二者都缺失 → SKIP
+    total = dict(base)
+    total.pop("operate_profit")
+    total["total_profit"] = 1000.0
+    assert fin.rule_4_4(total).verdict is MsVerdict.WARN
+    no_basis = dict(base)
+    no_basis.pop("operate_profit")
+    assert fin.rule_4_4(no_basis).verdict is MsVerdict.SKIP
+    # 缺税金字段 / 缺研发费用字段 → SKIP（宁缺毋滥）
+    no_tax = dict(base)
+    no_tax.pop("biz_tax_surchg")
     assert fin.rule_4_4(no_tax).verdict is MsVerdict.SKIP
+    no_rd = dict(base)
+    no_rd.pop("rd_exp")
+    assert fin.rule_4_4(no_rd).verdict is MsVerdict.SKIP
 
 
 def test_rule_5_1_agency_name_normalization():
@@ -258,8 +345,24 @@ def test_rule_3_3_requires_consecutive_years():
     # 在建工程高增/回落交替：不应累计成"连续 3 年"
     cip = [100.0, 140.0, 100.0, 140.0, 100.0, 140.0]
     fix = [1000.0, 1010.0, 1020.0, 1030.0, 1040.0, 1050.0]
-    result = fin.rule_3_3(cip, fix)
+    ta = [10000.0] * 6
+    result = fin.rule_3_3(cip, fix, ta)
     assert result.verdict is MsVerdict.WARN  # 最长连续 1 年，不是 FAIL
+
+
+def test_rule_3_3_materiality_floor():
+    # 2026-10-25 复核修正：在建工程/总资产 <1% 的年份不计入（低基数不误报）
+    cip = [0.04, 0.10, 0.20]
+    fix = [10.0, 10.1, 10.2]
+    ta = [100.0, 100.0, 100.0]
+    assert fin.rule_3_3(cip, fix, ta).verdict is MsVerdict.PASS
+    # 材料性达标（≥1%）且连续高增：仍正常触发
+    cip2 = [2.0, 4.0, 8.0]
+    ta2 = [100.0, 100.0, 100.0]
+    assert fin.rule_3_3(cip2, fix, ta2).verdict is MsVerdict.WARN
+    # total_assets 全缺失/有效不足 3 年：不猜测，SKIP
+    assert fin.rule_3_3(cip2, fix, [None] * 3).verdict is MsVerdict.SKIP
+    assert fin.rule_3_3(cip2, fix, [100.0]).verdict is MsVerdict.SKIP
 
 
 def test_rule_4_3_negative_revenue_not_fail():
@@ -267,3 +370,65 @@ def test_rule_4_3_negative_revenue_not_fail():
     result = fin.rule_4_3([100.0, 110.0, 120.0],
                           [100.0, 90.0, 80.0], [10.0, 11.0, 12.0])
     assert result.verdict is MsVerdict.PASS
+
+
+# ---------- 2026-10-25 复核修正：5.2 明细口径（名义持有人/稀释/减持） ----------
+
+def _holder_period(end_date, holders):
+    return {"end_date": end_date, "holders": [
+        {"name": n, "ratio": r, "amount": a, "nominee": nom}
+        for n, r, a, nom in holders]}
+
+
+def test_rule_5_2_excludes_nominee_holder():
+    # 比亚迪式：HKSCC 名义账户比例上升，但实际控制人持股数量未变 → PASS
+    periods = [
+        _holder_period("20221231", [("HKSCCNOMINEESLIMITED", 37.70, 999, True),
+                                    ("王传福", 17.64, 513, False)]),
+        _holder_period("20251231", [("HKSCCNOMINEESLIMITED", 40.38, 1200, True),
+                                    ("王传福", 16.90, 513, False)]),
+    ]
+    result = nonfin.rule_5_2(periods)
+    assert result.verdict is MsVerdict.PASS
+    assert "王传福" in result.detail and "持股数量" in result.detail
+
+
+def test_rule_5_2_dilution_passes_and_real_sell_fails():
+    # 比例下降但股数未变 = 股本扩张稀释 → PASS
+    diluted = [
+        _holder_period("20221231", [("甲", 52.0, 1000, False)]),
+        _holder_period("20251231", [("甲", 43.0, 1000, False)]),
+    ]
+    assert nonfin.rule_5_2(diluted).verdict is MsVerdict.PASS
+    # 股数连续减少且累计 >5% → FAIL
+    sold = [
+        _holder_period("20221231", [("甲", 52.0, 1000, False)]),
+        _holder_period("20231231", [("甲", 49.0, 960, False)]),
+        _holder_period("20241231", [("甲", 46.0, 930, False)]),
+        _holder_period("20251231", [("甲", 43.0, 900, False)]),
+    ]
+    assert nonfin.rule_5_2(sold).verdict is MsVerdict.FAIL
+    # 连续小幅减少（累计 2%）→ WARN
+    small = [
+        _holder_period("20221231", [("甲", 52.0, 1000, False)]),
+        _holder_period("20231231", [("甲", 51.0, 995, False)]),
+        _holder_period("20241231", [("甲", 50.5, 985, False)]),
+        _holder_period("20251231", [("甲", 50.0, 980, False)]),
+    ]
+    assert nonfin.rule_5_2(small).verdict is MsVerdict.WARN
+    # 小幅非连续减少 → PASS（未构成趋势性减持；>5% 的划转/EB 由深度模式披露豁免）
+    lumpy = [
+        _holder_period("20221231", [("甲", 52.25, 1000, False)]),
+        _holder_period("20231231", [("甲", 49.13, 1040, False)]),
+        _holder_period("20241231", [("甲", 46.81, 985, False)]),
+        _holder_period("20251231", [("甲", 43.47, 970, False)]),
+    ]
+    assert nonfin.rule_5_2(lumpy).verdict is MsVerdict.PASS
+
+
+def test_rule_5_2_accepts_dict_series_without_holders():
+    # 防御：非 fetch_holder_series 结构的 dict 列表按 ratio 字段降级，不崩溃
+    series = [{"ratio": 52.0}, {"ratio": 51.0}, {"ratio": 50.0}]
+    result = nonfin.rule_5_2(series)
+    assert result.verdict in (MsVerdict.PASS, MsVerdict.WARN, MsVerdict.FAIL,
+                              MsVerdict.SKIP)

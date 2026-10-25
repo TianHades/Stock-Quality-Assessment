@@ -7,6 +7,11 @@ from __future__ import annotations
 
 from sqa.minesweeper.models import MsResult, MsVerdict
 
+# 营收同比超过该阈值视为并表/重组阶跃（借壳/重大资产重组），运费对比不适用。
+# 松发 603268 2025 营收 +7774%（恒力重工并表）属此类；正常高增（宁德 2022 +152%）
+# 也不做运费对比（宁漏勿错）。
+_MAX_REVENUE_GROWTH = 1.0
+
 
 def rule_1_3(freight: dict, revenue_growth: float | None) -> MsResult:
     """运费增长 << 收入增长（WARN <50%，FAIL <25%）。"""
@@ -16,6 +21,11 @@ def rule_1_3(freight: dict, revenue_growth: float | None) -> MsResult:
     if revenue_growth is None or revenue_growth <= 0:
         return MsResult("1.3", "L1", MsVerdict.SKIP,
                         "深度模式：营收增速缺失或≤0，运费增速对比不适用")
+    if abs(revenue_growth) > _MAX_REVENUE_GROWTH:
+        # 营收阶跃（借壳/并表/重组）下，运费与收入不可比（松发 603268 +7774%）
+        return MsResult("1.3", "L1", MsVerdict.SKIP,
+                        f"深度模式：营收同比 {revenue_growth:.0%}（并表/重组阶跃），"
+                        "运费增速对比不适用")
     growth = freight["growth"]
     ratio = growth / revenue_growth
     detail = (f"运费增速 {growth:.1%} vs 营收增速 {revenue_growth:.1%}"
@@ -124,4 +134,16 @@ def supplement_5_8(occupation: dict) -> MsResult | None:
     if occupation.get("status") == "found":
         return MsResult("5.8", "L5", MsVerdict.FAIL,
                         "深度模式：年报“非经营性占用”段标注“适用”（关联方资金占用）")
+    return None
+
+
+def supplement_5_2(holder_events: dict) -> MsResult | None:
+    """5.2 补充检查：年报明确披露大股东持股减少系无偿划转/可交换债换股 → PASS。
+
+    仅当"划转/EB 披露"与"持股减少"同段出现时覆盖；未披露或语境不明不覆盖。
+    """
+    if holder_events.get("status") == "found":
+        return MsResult("5.2", "L5", MsVerdict.PASS,
+                        "深度模式：年报披露大股东持股减少系无偿划转/可交换债换股等"
+                        "非二级市场减持事项（详见证据片段）")
     return None

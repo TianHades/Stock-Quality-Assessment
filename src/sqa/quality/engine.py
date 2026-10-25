@@ -10,7 +10,8 @@ from sqa.data.fetchers import (
 )
 from sqa.data.tushare_client import TushareClient
 from sqa.minesweeper.fetch import (
-    fetch_annual_full, fetch_holder_ratio_series, fetch_pledge_ratio,
+    fetch_annual_full, fetch_holder_series, fetch_pledge_ratio,
+    holder_ratio_series,
 )
 from sqa.quality import metrics as M
 from sqa.quality.anchors import score_anchor
@@ -80,7 +81,7 @@ def run_quality(symbol: str, style: str, badges: tuple | list = (),
     cashflow = fetch_annual_full(client, "cashflow", ts_code, cfg.history_years, refresh)
     divs = fetch_dividend_records(client, ts_code, refresh)
     pledge = fetch_pledge_ratio(client, ts_code, refresh)
-    holders = fetch_holder_ratio_series(client, ts_code, refresh=refresh)
+    holders = holder_ratio_series(fetch_holder_series(client, ts_code, refresh=refresh))
     peers = fetch_peer_medians(client, basic.industry, refresh, exclude_code=ts_code)
 
     years = sorted(set(ind) | set(income) | set(balance) | set(cashflow))
@@ -111,6 +112,14 @@ def run_quality(symbol: str, style: str, badges: tuple | list = (),
     def agg_last(field: str) -> float | None:
         return agg(series(ind, field)[-pwindow:])
 
+    # 净利率口径（03 §1.1）：归母净利/营收，不能用 fina_indicator.netprofit_margin
+    # （实测=总净利/营收，含少数股东损益；2026-10-25 复核修正）。
+    net_margins = [
+        (a / b * 100.0) if (a is not None and b not in (None, 0)) else None
+        for a, b in zip(np_, revenue)
+    ]
+    net_margin = agg(net_margins[-pwindow:])
+
     gm_peer = (peers or {}).get("gm_median")
     dims["profitability"] = {"indicators": [
         _ind("roe", agg_last("roe"), (3, 8, 18), pwin),
@@ -118,7 +127,7 @@ def run_quality(symbol: str, style: str, badges: tuple | list = (),
         _ind("gross_margin", agg_last("grossprofit_margin"),
              (gm_peer - 15, gm_peer, gm_peer + 15) if gm_peer is not None else (0, 0, 0),
              pwin, "" if gm_peer is not None else "同行毛利率中位数缺失（相对锚点不可用）"),
-        _ind("net_margin", agg_last("netprofit_margin"), (2, 6, 15), pwin),
+        _ind("net_margin", net_margin, (2, 6, 15), pwin),
     ]}
 
     # ---- 2. 成长性（周期股整维 SKIP——03 号文档 §4.2）----
@@ -157,15 +166,24 @@ def run_quality(symbol: str, style: str, badges: tuple | list = (),
     debt_peer = (peers or {}).get("debt_median")
 
     ta = latest_bal.get("total_assets")
-    ibd = sum(float(latest_bal.get(n) or 0.0) for n in ("st_borr", "lt_borr", "bond_payable"))
     ncl = next((latest_bal.get(n) for n in ("non_cur_liab_due_1y", "nca_within_1y_liab",
                                            "ncl_1y", "non_cur_liab_1y")
                 if latest_bal.get(n) is not None), 0.0)
+    # 有息负债须含一年内到期非流动负债（2026-10-25 复核修正）
+    ibd = (sum(float(latest_bal.get(n) or 0.0)
+               for n in ("st_borr", "lt_borr", "bond_payable"))
+           + float(ncl or 0.0))
     short_debt = float(latest_bal.get("st_borr") or 0.0) + (ncl or 0.0)
     money = latest_bal.get("money_cap")
-    interest = latest_inc.get("int_exp") or (
-        abs(latest_inc["fin_exp"]) if latest_inc.get("fin_exp") else None)
-    ebit = latest_inc.get("total_profit")
+    # 利息保障：EBIT=(利润总额+利息费用)；分母只用 int_exp（利息费用字段）。
+    # 不再用 abs(fin_exp) 净额兜底——净财务费用含利息收入，会算出 60+ 倍假高覆盖；
+    # 资本化利息不在 tushare 主表，缺失时 SKIP 并保留人工复核（03 §1.4 口径待深模补数）。
+    interest = latest_inc.get("int_exp")
+    if interest is not None and interest <= 0:
+        interest = None
+    total_profit = latest_inc.get("total_profit")
+    ebit = (total_profit + interest) if (total_profit is not None
+                                         and interest is not None) else None
 
     dims["health"] = {"indicators": [
         _ind("debt_to_assets", latest_ind.get("debt_to_assets"),
@@ -173,7 +191,9 @@ def run_quality(symbol: str, style: str, badges: tuple | list = (),
              "latest", "" if debt_peer is not None else "同行资产负债率中位数缺失"),
         _ind("ibd_ratio", ibd / ta * 100 if ta else None, (40, 20, 5), "latest"),
         _ind("interest_cover",
-             ebit / interest if ebit is not None and interest else None, (1.5, 4, 10), "latest"),
+             ebit / interest if ebit is not None and interest else None,
+             (1.5, 4, 10), "latest",
+             "" if interest is not None else "利息费用字段缺失/资本化利息未覆盖，SKIP 待人工复核"),
         # 无短期有息负债 = 最佳覆盖（金标准教训：茅台无短债被判 SKIP 拉垮整维度）
         _ind("short_debt_cover",
              money / short_debt if money is not None and short_debt > 0
@@ -209,15 +229,21 @@ def run_quality(symbol: str, style: str, badges: tuple | list = (),
     payout = M.avg_payout(divs, eps_map, this_year)
     gw = latest_bal.get("goodwill")
     equity = latest_bal.get("total_hldr_eqy_exc_min_int") or latest_bal.get("total_hldr_eqy")
-    holder_change = (holders[-1] - holders[0]) if len(holders) >= 2 else None
+    positive_holders = [h for h in holders if h is not None]
+    holder_change = ((positive_holders[-1] - positive_holders[0])
+                     if len(positive_holders) >= 2 else None)
 
     dims["governance"] = {"indicators": [
         _ind("payout_ratio", payout * 100 if payout is not None else None, (0, 20, 40), "3y_mean"),
         _ind("pledge_ratio", pledge, (50, 20, 5), "latest"),
         _ind("holder_change", holder_change, (-5, 0, 1), "3y_span"),
+        # 商誉缺失（字段 None）≠ 无商誉：缺失 → SKIP；明确为 0 才给满分
+        # （2026-10-25 复核修正：原实现把 None 当 0，神华/茅台等无字段标的被误给满分）
         _ind("goodwill_ratio",
-             (gw / equity * 100) if gw and equity else (0.0 if not gw else None),
-             (30, 10, 2), "latest"),
+             ((gw / equity * 100) if (gw is not None and equity) else
+              (0.0 if gw == 0 else None)),
+             (30, 10, 2), "latest",
+             "" if gw is not None else "商誉字段缺失"),
     ]}
 
     # ---- 聚合（03 号文档 §4.3-§4.4）----

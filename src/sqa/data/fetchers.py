@@ -63,11 +63,27 @@ def _annual_rows(rows: list[dict]) -> dict[int, dict]:
     return dict(sorted(by_year.items()))
 
 
+def ocf_minus_capex(cashflow_row: dict | None) -> float | None:
+    """规则 4.5 的 FCF 口径：经营 CF − 购建长期资产支出（与规则文本一致）。
+
+    与 ``compute_fcf`` 区分：后者优先 tushare ``free_cashflow``（定义不同、可能跨年
+    混用），质量层沿用；排雷 4.5 按上游规则"自行计算 FCF = 经营 CF − Capex"，
+    避免 free_cashflow 与 OCF−capex 口径混用造成误报（睿创微纳 2023/2024 实盘）。
+    """
+    row = cashflow_row or {}
+    ocf = row.get("n_cashflow_act")
+    capex = row.get("c_pay_acq_const_fiolta")
+    if ocf is None or capex is None:
+        return None
+    return ocf - capex
+
+
 def compute_fcf(cashflow_row: dict | None, indicator_row: dict | None = None) -> float | None:
-    """统一 FCF 口径（排雷/质量/模块/分类共用）：
+    """统一 FCF 口径（质量/模块/分类共用）：
 
     优先 free_cashflow；缺失时 经营 CF − 购建长期资产（c_pay_acq_const_fiolta）；
-    再缺失回退 fina_indicator 的 fcff。
+    再缺失回退 fina_indicator 的 fcff。注意：排雷 4.5 使用 ``ocf_minus_capex``，
+    不经过本函数（见其 docstring）。
     """
     row = cashflow_row or {}
     fcf = row.get("free_cashflow")

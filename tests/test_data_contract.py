@@ -38,9 +38,11 @@ def _income_row(**overrides) -> dict:
         "ts_code": "600519.SH", "end_date": "20251231", "ann_date": "20260401",
         "report_type": "1", "revenue": 1500.0, "oper_cost": 100.0,
         "biz_tax_surchg": 180.0, "sell_exp": 50.0, "admin_exp": 60.0,
-        "fin_exp": -130.0, "n_income": 1000.0, "n_income_attr_p": 750.0,
-        "oth_b_income": 30.0, "assets_impair_loss": None,
-        "credit_impa_loss": None,
+        "fin_exp": -130.0, "rd_exp": 0.0, "n_income": 1000.0,
+        "n_income_attr_p": 750.0, "oth_b_income": 30.0,
+        # 2026-10-25 复核：4.4 比较基准改为营业利润（税前口径）
+        "operate_profit": 1000.0, "total_profit": 1147.0,
+        "assets_impair_loss": None, "credit_impa_loss": None,
     }
     row.update(overrides)
     return row
@@ -54,7 +56,8 @@ def test_fetch_annual_full_requests_optional_fields():
     api, params = client.calls[0]
     assert api == "income"
     fields = params["fields"]
-    for name in ("biz_tax_surchg", "credit_impa_loss", "inv_turn", "n_income"):
+    for name in ("biz_tax_surchg", "credit_impa_loss", "inv_turn", "n_income",
+                 "rd_exp"):
         if name == "inv_turn":
             continue  # income 无此字段；下面单独校验 indicator
         assert name in fields
@@ -164,13 +167,19 @@ def test_rule_3_4_uses_real_long_term_deferred_field():
 
 
 def test_rule_4_4_uses_business_tax_and_total_net_income():
-    row = _income_row()  # core=1240, n_income=1000 → 24% WARN；attr=750 会是 65% FAIL
+    row = _income_row()  # rd=0、core=1240、n_income=1000 → 24% WARN；attr=750 会是 65% FAIL
     result = fin.rule_4_4(row)
     assert result.verdict is MsVerdict.WARN
-    # 缺少税金字段 → SKIP（宁缺毋滥）
+    # 扣减研发费用后背离下降（2026-10-25 复核修正）
+    with_rd = _income_row(rd_exp=240.0)  # core=1000 → 0% PASS
+    assert fin.rule_4_4(with_rd).verdict is MsVerdict.PASS
+    # 缺少税金字段 / 研发费用字段 → SKIP（宁缺毋滥）
     no_tax = dict(row)
     no_tax.pop("biz_tax_surchg")
     assert fin.rule_4_4(no_tax).verdict is MsVerdict.SKIP
+    no_rd = dict(row)
+    no_rd.pop("rd_exp")
+    assert fin.rule_4_4(no_rd).verdict is MsVerdict.SKIP
 
 
 def test_rule_s2_zero_debt_pass_and_new_field():
@@ -181,3 +190,14 @@ def test_rule_s2_zero_debt_pass_and_new_field():
                         "non_cur_liab_due_1y": 400.0, "total_assets": 1000.0})
     assert r.verdict is MsVerdict.FAIL
     assert "0.24" in r.detail
+
+
+def test_ocf_minus_capex_not_free_cashflow():
+    """4.5 的 FCF 口径 = 经营 CF − Capex，不得用 tushare free_cashflow 替代。"""
+    from sqa.data.fetchers import compute_fcf, ocf_minus_capex
+
+    row = {"n_cashflow_act": 500.0, "c_pay_acq_const_fiolta": 400.0,
+           "free_cashflow": -900.0}
+    assert ocf_minus_capex(row) == 100.0
+    assert compute_fcf(row) == -900.0
+    assert ocf_minus_capex({"n_cashflow_act": 500.0}) is None

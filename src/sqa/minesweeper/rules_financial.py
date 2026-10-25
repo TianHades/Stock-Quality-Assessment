@@ -166,20 +166,31 @@ def rule_1_6(income: list[dict]) -> MsResult:
 
 # ---------- Layer 2: 现金流信号 ----------
 
-def rule_2_1(ocf: list[float | None], icf: list[float | None]) -> MsResult:
-    """经营 CF 优异 + 投资 CF 持续大额为负（扩张烧钱过度）。"""
-    years_hit = 0
-    for o, i in zip(ocf, icf):
-        if o is not None and i is not None and o > 0 and abs(i) > o * 0.8:
-            years_hit += 1
+def rule_2_1(ocf: list[float | None], capex: list[float | None]) -> MsResult:
+    """经营 CF 优异 + 资本开支持续大额（扩张烧钱过度）。
+
+    2026-10-25 复核修正：原实现用投资活动现金流净额（含理财申购/投资支付），
+    对"现金管理型"公司会误报——睿创微纳 2025 年 ICF -18.3 亿中理财净投入约
+    12.8 亿、真实 capex 仅 5.8 亿。改按"购建固定资产/无形资产等支付的现金"
+    （c_pay_acq_const_fiolta）口径判定；**有效配对年份 <3 时 SKIP**（不猜测）。
+    """
     if len([o for o in ocf if o is not None]) < 3:
         return MsResult("2.1", "L2", MsVerdict.SKIP, "现金流数据不足")
+    paired = [(o, c) for o, c in zip(ocf, capex)
+              if o is not None and c is not None]
+    if len(paired) < 3:
+        return MsResult("2.1", "L2", MsVerdict.SKIP,
+                        "资本开支/经营现金流有效配对数据不足（<3年）")
+    years_hit = sum(1 for o, c in paired if o > 0 and abs(c) > o * 0.8)
 
     if years_hit >= 4:
-        return MsResult("2.1", "L2", MsVerdict.FAIL, f"近10年 {years_hit} 年投资CF吞掉经营CF")
+        return MsResult("2.1", "L2", MsVerdict.FAIL,
+                        f"近10年 {years_hit} 年资本开支超过经营CF的80%")
     if years_hit in (2, 3):
-        return MsResult("2.1", "L2", MsVerdict.WARN, f"{years_hit} 年投资CF超经营CF八成")
-    return MsResult("2.1", "L2", MsVerdict.PASS, f"{years_hit} 年投资CF超经营CF八成")
+        return MsResult("2.1", "L2", MsVerdict.WARN,
+                        f"{years_hit} 年资本开支超过经营CF的80%")
+    return MsResult("2.1", "L2", MsVerdict.PASS,
+                    f"{years_hit} 年资本开支超过经营CF的80%")
 
 
 def rule_2_2(ocf: list[float | None]) -> MsResult:
@@ -280,13 +291,38 @@ def rule_3_2(inv_turn: list[float | None], gm_series: list[float | None]) -> MsR
                     f"存货周转 {turn_change:+.0%}，毛利率 {gm_change:+.1f}pp")
 
 
-def rule_3_3(cip: list[float | None], fix: list[float | None]) -> MsResult:
-    """在建工程持续增长但不转固（连续年份，非累计年数）。"""
+def rule_3_3(cip: list[float | None], fix: list[float | None],
+             total_assets: list[float | None] | None = None) -> MsResult:
+    """在建工程持续增长但不转固（连续年份，非累计年数）。
+
+    2026-10-25 复核修正：增加材料性门槛——仅当在建工程/总资产 ≥1% 的年份才计数，
+    避免极小基数（如 2019 年在建工程 0.04 亿、占总资产 0.2%）因相对增速触发；
+    ``total_assets`` 缺省时不做材料性过滤（向后兼容）；若提供但有效总资产
+    <3 年，材料性门槛不可用 → SKIP。
+    """
+    if total_assets is not None and cip:
+        valid_ta = sum(1 for ta in total_assets if ta is not None)
+        if valid_ta < 3:
+            return MsResult("3.3", "L3", MsVerdict.SKIP,
+                            "总资产数据不足（材料性门槛不可用）")
+
+    def _material(idx: int) -> bool:
+        if total_assets is None:
+            return True
+        ta = total_assets[idx] if idx < len(total_assets) else None
+        c = cip[idx]
+        if ta is None or c is None or ta <= 0:
+            return False
+        return abs(c) / ta >= 0.01
+
     streak = 0
     max_streak = 0
     for i in range(1, min(len(cip), len(fix))):
         c, p, f_c, f_p = cip[i], cip[i - 1], fix[i], fix[i - 1]
         if None in (c, p, f_c, f_p) or p <= 0:
+            streak = 0
+            continue
+        if not _material(i):
             streak = 0
             continue
         cip_g = c / p - 1.0
@@ -299,9 +335,11 @@ def rule_3_3(cip: list[float | None], fix: list[float | None]) -> MsResult:
     if not cip or cip[-1] is None:
         return MsResult("3.3", "L3", MsVerdict.SKIP, "在建工程数据缺失")
     if max_streak >= 3:
-        return MsResult("3.3", "L3", MsVerdict.FAIL, f"连续 {max_streak} 年在建工程高增不转固")
+        return MsResult("3.3", "L3", MsVerdict.FAIL,
+                        f"连续 {max_streak} 年在建工程高增不转固（在建工程/总资产≥1%）")
     if max_streak >= 1:
-        return MsResult("3.3", "L3", MsVerdict.WARN, f"{max_streak} 年在建工程高增不转固")
+        return MsResult("3.3", "L3", MsVerdict.WARN,
+                        f"{max_streak} 年在建工程高增不转固（材料性达标）")
     return MsResult("3.3", "L3", MsVerdict.PASS, "在建工程无异常")
 
 
@@ -369,24 +407,53 @@ def rule_3_5(income_latest: dict, balance_latest: dict,
 # ---------- Layer 4: 交叉验证 ----------
 
 def rule_4_1(ocf: list[float | None], np_: list[float | None]) -> MsResult:
-    """经营 CF / 净利润 < 1（最核心验证）。"""
-    pairs = [(o, n) for o, n in zip(ocf, np_) if o is not None and n is not None and n > 0]
-    if len(pairs) < 5:
-        return MsResult("4.1", "L4", MsVerdict.SKIP, "数据不足（需5年正利润）")
+    """经营 CF / 净利润 < 1（最核心验证）。
 
-    ratios = [o / n for o, n in pairs]
-    below = sum(1 for r in ratios[-5:] if r < 1)
-    streak = best = 0
-    for r in ratios:
-        streak = streak + 1 if r < 1 else 0
-        best = max(best, streak)
+    2026-10-25 复核修正：判档改用**近 5 个年度**（按年份对齐，缺失数据记为
+    None，不挤占窗口）；10 年窗口只用于 detail 中的历史最长连续段。**亏损年
+    （净利润≤0）按"CF/净利<1"命中计**（负比值必然小于 1），避免亏损/缺失年
+    把连续段冲断后误判 PASS 或 SKIP；近 5 年有效数据不足 3 年 → SKIP。
+    """
+    entries: list[bool | None] = []
+    for o, n in zip(ocf, np_):
+        if o is None or n is None:
+            entries.append(None)
+        elif n <= 0:
+            entries.append(True)  # 亏损年：负比值 <1，计为命中
+        else:
+            entries.append(o / n < 1.0)
+    valid = [e for e in entries if e is not None]
+    if len(valid) < 5:
+        return MsResult("4.1", "L4", MsVerdict.SKIP, "数据不足（需5年有效数据）")
 
-    if best >= 3:
-        return MsResult("4.1", "L4", MsVerdict.FAIL, f"连续 {best} 年 CF/净利 < 1")
-    if below >= 2:
-        return MsResult("4.1", "L4", MsVerdict.WARN, f"近5年 {below} 年 CF/净利 < 1")
+    def _streak(seq: list[bool | None]) -> int:
+        streak = best = 0
+        for hit in seq:
+            if hit is True:
+                streak += 1
+                best = max(best, streak)
+            else:
+                streak = 0  # False/None（无数据）中断连续段
+        return best
+
+    recent = entries[-5:]
+    recent_valid = [e for e in recent if e is not None]
+    if len(recent_valid) < 3:
+        return MsResult("4.1", "L4", MsVerdict.SKIP,
+                        "近5年有效数据不足（CF/净利可判定年份 <3）")
+    recent_hits = sum(1 for e in recent_valid if e)
+    best_recent = _streak(recent)
+    best_all = _streak(entries)
+    history = f"（近5年有效 {len(recent_valid)} 年；10 年窗口历史最长连续 {best_all} 年）"
+
+    if best_recent >= 3:
+        return MsResult("4.1", "L4", MsVerdict.FAIL,
+                        f"近5年连续 {best_recent} 年 CF/净利 < 1{history}")
+    if recent_hits >= 2:
+        return MsResult("4.1", "L4", MsVerdict.WARN,
+                        f"近5年 {recent_hits} 年 CF/净利 < 1{history}")
     return MsResult("4.1", "L4", MsVerdict.PASS,
-                    f"近5年 CF/净利均值 {sum(ratios[-5:]) / len(ratios[-5:]):.2f}")
+                    f"近5年 CF/净利 <1 共 {recent_hits} 年{history}")
 
 
 def rule_4_2(cash_recv: list[float | None], revenue: list[float | None]) -> MsResult:
@@ -448,14 +515,15 @@ def rule_4_3(total_assets: list[float | None], revenue: list[float | None],
 
 
 def rule_4_4(income_latest: dict) -> MsResult:
-    """核心利润 vs 净利润背离。
+    """核心利润 vs 营业利润背离。
 
-    核心利润 = 营收 − 营业成本 − 税金及附加 − 三费。
-    口径说明（2026-10 校准）：
-    - 税金及附加字段真实名为 ``biz_tax_surchg``（历史 operate_tax_add/biz_tax_sur 不存在）；
-    - 核心利润是少数股东损益前口径，必须与**总净利润 n_income** 比较，否则少数股东
-      占比高的公司（神华：核心/归母 40.3% vs 核心/总净利 18.1%）会系统性误报；
-      n_income 缺失时才回退 n_income_attr_p。
+    核心利润 = 营收 − 营业成本 − 税金及附加 − 销售/管理/**研发**/财务费用。
+    口径说明（2026-10 校准 + 2026-10-25 复核修正）：
+    - 税金及附加字段真实名为 ``biz_tax_surchg``；研发费用须扣减 ``rd_exp``；
+    - **比较基准 = 营业利润 operate_profit（税前口径）**：核心利润是税前经营口径，
+      与税后净利润比较会因所得税产生系统性背离（茅台 31% vs 营业利润 2.7%、
+      京东方 36% vs 3.0%），2026-10-25 复核改为同税基比较；营业利润缺失时回退
+      利润总额 total_profit，二者均缺失 → SKIP（不再回退税后净利，避免税基错配）。
     """
     rev = _f(income_latest, "revenue")
     cost = _f(income_latest, "oper_cost")
@@ -463,35 +531,59 @@ def rule_4_4(income_latest: dict) -> MsResult:
     sell = _f(income_latest, "sell_exp")
     admin = _f(income_latest, "admin_exp")
     fin = _f(income_latest, "fin_exp")
-    np_all = _f(income_latest, "n_income", "n_income_attr_p")
-    if None in (rev, cost, tax, sell, admin, fin, np_all) or np_all == 0:
-        return MsResult("4.4", "L4", MsVerdict.SKIP, "核心利润字段缺失（含税金及附加）")
+    rd = _f(income_latest, "rd_exp")
+    basis = _f(income_latest, "operate_profit", "total_profit")
+    if None in (rev, cost, tax, sell, admin, fin) or basis is None or basis == 0:
+        return MsResult("4.4", "L4", MsVerdict.SKIP,
+                        "核心利润字段缺失（含税金及附加/营业利润）")
+    if rd is None:
+        return MsResult("4.4", "L4", MsVerdict.SKIP,
+                        "研发费用字段缺失（核心利润需扣减 rd_exp）")
 
-    core = rev - cost - tax - sell - admin - fin
-    divergence = abs(core - np_all) / abs(np_all) * 100
+    core = rev - cost - tax - sell - admin - rd - fin
+    divergence = abs(core - basis) / abs(basis) * 100
     if divergence > 40:
         return MsResult("4.4", "L4", MsVerdict.FAIL,
-                        f"核心利润与净利背离 {divergence:.0f}%（>40%）")
+                        f"核心利润与营业利润背离 {divergence:.0f}%（>40%）")
     if divergence > 20:
-        return MsResult("4.4", "L4", MsVerdict.WARN, f"核心利润与净利背离 {divergence:.0f}%")
-    return MsResult("4.4", "L4", MsVerdict.PASS, f"核心利润与净利背离 {divergence:.0f}%")
+        return MsResult("4.4", "L4", MsVerdict.WARN,
+                        f"核心利润与营业利润背离 {divergence:.0f}%")
+    return MsResult("4.4", "L4", MsVerdict.PASS,
+                    f"核心利润与营业利润背离 {divergence:.0f}%")
 
 
 def rule_4_5(np_: list[float | None], fcf: list[float | None]) -> MsResult:
-    """净利润增长 + FCF 持续为负。"""
-    years_hit = 0
-    for i in range(1, min(len(np_), len(fcf))):
-        p_cur, p_prev = np_[i], np_[i - 1]
-        f = fcf[i]
-        if None in (p_cur, p_prev, f):
+    """净利润增长 + FCF 持续为负。
+
+    2026-10-25 复核修正：判档改用**近 5 个年度**（按年份对齐，缺失年份记为 None，
+    不挤占窗口；取 np_/fcf 的公共年份，避免长度不一致时错位）；历史命中年数仅在
+    detail 中展示；近 5 年有效数据不足 3 年 → SKIP（避免少量数据静默 PASS）。
+    原实现统计 10 年窗口总命中数，睿创微纳式"2017–2020、2023–2024 扩张期命中、
+    2025 年 FCF 已转正"的公司会被历史包袱长期锁定 FAIL。
+    """
+    n_years = min(len(np_), len(fcf))
+    flags: list[bool | None] = []
+    for i in range(1, n_years):
+        p_cur, p_prev, f = np_[i], np_[i - 1], fcf[i]
+        if p_cur is None or p_prev is None or f is None:
+            flags.append(None)
             continue
-        if p_cur > 0 and p_cur > p_prev and f < 0:
-            years_hit += 1
+        flags.append(p_cur > 0 and p_cur > p_prev and f < 0)
     if not any(f is not None for f in fcf):
         return MsResult("4.5", "L4", MsVerdict.SKIP, "FCF 数据缺失")
 
-    if years_hit >= 3:
-        return MsResult("4.5", "L4", MsVerdict.FAIL, f"{years_hit} 年利润增长但 FCF 为负")
-    if years_hit == 2:
-        return MsResult("4.5", "L4", MsVerdict.WARN, f"{years_hit} 年利润增长但 FCF 为负")
-    return MsResult("4.5", "L4", MsVerdict.PASS, f"{years_hit} 年利润增长但 FCF 为负")
+    recent = flags[-5:]
+    recent_valid = [flag for flag in recent if flag is not None]
+    if len(recent_valid) < 3:
+        return MsResult("4.5", "L4", MsVerdict.SKIP, "近5年有效数据不足（<3年）")
+    recent_hits = sum(1 for flag in recent_valid if flag)
+    all_hits = sum(1 for flag in flags if flag is True)
+    history = f"（10 年窗口历史 {all_hits} 年）"
+    if recent_hits >= 3:
+        return MsResult("4.5", "L4", MsVerdict.FAIL,
+                        f"近5年 {recent_hits} 年利润增长但 FCF 为负{history}")
+    if recent_hits == 2:
+        return MsResult("4.5", "L4", MsVerdict.WARN,
+                        f"近5年 {recent_hits} 年利润增长但 FCF 为负{history}")
+    return MsResult("4.5", "L4", MsVerdict.PASS,
+                    f"近5年 {recent_hits} 年利润增长但 FCF 为负{history}")

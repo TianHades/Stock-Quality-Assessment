@@ -120,3 +120,18 @@ def test_grade_adjustment_by_minesweeper():
 
 def test_dimensions_tuple_covers_all():
     assert set(DIMENSIONS) == set(STYLE_WEIGHTS["growth"].keys())
+
+
+def test_anchor_out_of_range_clamped_before_extrapolation():
+    """2026-10-25 复核修正：越界值必须先钳 0/100，不能外推成非单调分数。"""
+    assert score_anchor(2.9, 3, 8, 18) == 0.0     # ROE 略低于 zero 锚
+    assert score_anchor(1.4, 1.5, 4, 10) == 0.0   # 利息保障略低于 zero 锚
+    assert score_anchor(-2, 0, 8, 25) == 0.0      # 营收 CAGR 为负
+    assert score_anchor(0.5, 0.8, 1.5, 3) == 0.0  # 短债覆盖低于 zero 锚
+    # 单调性：越靠近 0 分锚不应更高分
+    assert score_anchor(2.9, 3, 8, 18) <= score_anchor(3.0, 3, 8, 18)
+
+
+def test_anchor_rejects_non_monotonic_anchors():
+    with pytest.raises(ValueError):
+        score_anchor(1.0, 0, 15, 8)

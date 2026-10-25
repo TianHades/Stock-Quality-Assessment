@@ -85,6 +85,7 @@ def run_deep(symbol: str, company_name: str, year: int,
         regulatory = E.extract_regulatory(document.pages)
         rd = E.extract_rd_capitalization(document.pages)
         occupation = E.extract_non_operating_occupation(document.pages)
+        holder_events = E.extract_holder_events(document.pages)
 
         rules = [
             R.rule_1_3(freight, revenue_growth),
@@ -97,7 +98,8 @@ def run_deep(symbol: str, company_name: str, year: int,
         ]
         evidence = _evidence({
             "1.3": freight, "5.3": cfo, "5.4": independent, "5.5": customers,
-            "5.6": acquisitions, "5.8": occupation, "5.9": regulatory, "6.2": rd,
+            "5.6": acquisitions, "5.2": holder_events, "5.8": occupation,
+            "5.9": regulatory, "6.2": rd,
         })
     except Exception as exc:  # noqa: BLE001 - 证据抽取失败不中断排雷主流程
         return _failed(f"PDF 证据抽取失败: {type(exc).__name__}: {exc}", pdf_info)
@@ -108,5 +110,6 @@ def run_deep(symbol: str, company_name: str, year: int,
         "pdf": pdf_info,
         "rules": rules,
         "override_5_8": R.supplement_5_8(occupation),
+        "override_5_2": R.supplement_5_2(holder_events),
         "evidence": evidence,
     }

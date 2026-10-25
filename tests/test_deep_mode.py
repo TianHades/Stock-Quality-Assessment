@@ -347,3 +347,319 @@ def test_low_page_coverage_rejected(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(pdf_text, "_pypdf_pages", lambda p: pages)
     with pytest.raises(PdfTextError):
         pdf_text.extract_pdf(path, refresh=True)
+
+
+# ---------- 2026-10-25 复核修正：6.2 空白单元格 / 5.9 章节标题 ----------
+
+def test_rd_capitalization_blank_cell_derives_zero():
+    """睿创微纳式：资本化研发投入为空白单元格，不得串行取下一行合计数。"""
+    pages = [
+        "费用化研发投入 1,153,401,424.60 860,733,802.61 34.00\n"
+        "资本化研发投入\n"
+        "研发投入合计 1,153,401,424.60 860,733,802.61 34.00\n"
+        "研发投入资本化的比重（%）"
+    ]
+    data = E.extract_rd_capitalization(pages)
+    assert data["status"] == "ok"
+    assert data["basis"] == "amount_derived"
+    assert data["ratio"] == pytest.approx(0.0)
+    assert R.rule_6_2(data).verdict is MsVerdict.PASS
+
+
+def test_rd_capitalization_total_minus_expensed():
+    pages = ["费用化研发投入 8.00 亿元\n"
+             "资本化研发投入\n"
+             "研发投入合计 10.00 亿元"]
+    data = E.extract_rd_capitalization(pages)
+    assert data["status"] == "ok"
+    assert data["ratio"] == pytest.approx(0.2)
+    assert R.rule_6_2(data).verdict is MsVerdict.PASS
+
+
+def test_rd_capitalization_next_line_amount_still_supported():
+    """pypdf 常见版式：标签行 + 下一行纯数字仍可绑定。"""
+    pages = ["资本化研发投入\n150,000,000.00\n研发投入合计 1,500,000,000.00"]
+    data = E.extract_rd_capitalization(pages)
+    assert data["status"] == "ok"
+    assert data["ratio"] == pytest.approx(0.1)
+
+
+def test_rd_capitalization_real_percent_binding_unchanged():
+    data = E.extract_rd_capitalization(["研发投入资本化的比重（%） 16.00"])
+    assert data["status"] == "ok" and data["ratio"] == pytest.approx(0.16)
+
+
+def test_rd_capitalization_mixed_units_rejected():
+    # 合计用亿元、费用化无单位（8.00 实为 8 亿元）：不得按 10亿−8元 推导出 100%
+    pages = ["研发投入合计 10.00 亿元\n资本化研发投入\n费用化研发投入 8.00"]
+    data = E.extract_rd_capitalization(pages)
+    assert data["status"] != "ok"
+    # 资本化金额与合计相等且未披露费用化金额：无法确认，转 ambiguous
+    pages2 = ["资本化研发投入 10.00 亿元\n研发投入合计 10.00 亿元"]
+    data2 = E.extract_rd_capitalization(pages2)
+    assert data2["status"] != "ok"
+    assert R.rule_6_2(data2).verdict is MsVerdict.SKIP
+
+
+def test_rd_capitalization_negative_amount_rejected():
+    # 负金额属于报表口径异常/符号解析错误：不得取绝对值后当成有效资本化
+    pages = ["资本化研发投入 -1.50 亿元\n研发投入合计 10.00 亿元"]
+    data = E.extract_rd_capitalization(pages)
+    assert data["status"] != "ok"
+    assert R.rule_6_2(data).verdict is MsVerdict.SKIP
+
+
+def test_rd_capitalization_percent_not_treated_as_amount():
+    # 百分比行（同行或续行）不得被当作资本化金额
+    same_line = E.extract_rd_capitalization(
+        ["资本化研发投入 16.00%\n研发投入合计 10.00 亿元"])
+    assert same_line["status"] != "ok"
+    continuation = E.extract_rd_capitalization(
+        ["资本化研发投入\n16.00%\n研发投入合计 10.00 亿元"])
+    assert continuation["status"] != "ok"
+
+
+def test_rd_capitalization_derivation_only_when_cap_missing():
+    # 资本化金额存在但单位不一致时，不得用 合计−费用化 推导（否则误判 100%）
+    pages = ["资本化研发投入 0.30 亿元\n研发投入合计 10,000 万元\n"
+             "费用化研发投入 0 万元"]
+    data = E.extract_rd_capitalization(pages)
+    assert data["status"] != "ok"
+    # 占比行（费用化研发投入占比）不得作为"费用化金额"续行
+    ratio_row = E.extract_rd_capitalization(
+        ["研发投入合计 10,000\n费用化研发投入占比（%）\n60"])
+    assert ratio_row["status"] != "ok"
+
+
+def test_rd_capitalization_percent_continuation():
+    # 百分比值在下一行（pypdf 常见版式）：支持续行解析
+    zero = E.extract_rd_capitalization(["研发投入资本化的比重（%）\n0.00"])
+    assert zero["status"] == "ok" and zero["ratio"] == pytest.approx(0.0)
+    warn = E.extract_rd_capitalization(
+        ["资本化研发投入占比（%）\n35\n研发投入合计 100"])
+    assert warn["status"] == "ok" and warn["ratio"] == pytest.approx(0.35)
+    assert R.rule_6_2(warn).verdict in (MsVerdict.WARN, MsVerdict.FAIL)
+
+
+def test_rd_capitalization_cap_equals_total_prefers_percent():
+    # cap=合计且缺费用化时，若同行有明确百分比证据，应优先采用百分比
+    pages = ["资本化研发投入 10.00 亿元\n研发投入合计 10.00 亿元\n"
+             "研发投入资本化的比重（%） 0.00"]
+    data = E.extract_rd_capitalization(pages)
+    assert data["status"] == "ok"
+    assert data["ratio"] == pytest.approx(0.0)
+    assert R.rule_6_2(data).verdict is MsVerdict.PASS
+
+
+def test_regulatory_section_headers_ignored():
+    """年报章节模板标题（"十、…受到处罚及整改情况"）不得当作处罚事实。"""
+    pages = ["十、上市公司及其董事、高级管理人员、控股股东、实际控制人涉嫌违法违规、"
+             "受到处罚及整改情况\n□适用 √不适用"]
+    data = E.extract_regulatory(pages)
+    assert data["status"] == "clear"
+    assert R.rule_5_9(data).verdict is MsVerdict.PASS
+
+    paren = E.extract_regulatory(
+        ["（五）近三年受证券监管机构处罚的情况说明\n□适用 √不适用"])
+    assert paren["status"] == "clear"
+
+    same_line = E.extract_regulatory(
+        ["十、公司涉嫌违法违规、受到处罚及整改情况：□适用 √不适用"])
+    assert same_line["status"] == "clear"
+
+    # PDF 抽取把标题断行（…及整改\n情况）：仍应识别为标题
+    split_line = E.extract_regulatory(
+        ["十、上市公司及其董事、高级管理人员、控股股东、实际控制人涉嫌违法违规、"
+         "受到处罚及整改\n情况"])
+    assert split_line["status"] == "clear"
+
+
+def test_regulatory_genuine_numbered_or_narrative_penalty_kept():
+    # 正文中的真实处罚（阿拉伯数字编号）不得被标题跳过逻辑吞掉
+    numbered = E.extract_regulatory(["1、公司收到证监局警示函。"])
+    assert numbered["status"] == "warn"
+    assert R.rule_5_9(numbered).verdict is MsVerdict.WARN
+    # 中文序号但不是"情况/说明"标题的真实叙述仍应识别
+    narrative = E.extract_regulatory(["十、公司控股股东被证监会立案调查。"])
+    assert narrative["status"] == "fail"
+    # 中文序号 + 处罚事实措辞（存在/受到处罚）不得按标题跳过
+    fact = E.extract_regulatory(["十、公司存在受到处罚的情况。"])
+    assert fact["status"] == "warn"
+    # 中文序号 + "整改情况" + 具体处罚类型（通报批评）不得被标题守卫吞掉
+    numbered_fact = E.extract_regulatory(
+        ["（一）公司受到深交所通报批评，具体整改情况如下："])
+    assert numbered_fact["status"] == "warn"
+    # 年份中的 0 不得被当作"零次"否定（2020 年被立案 / 2024 年警示函）
+    year_fail = E.extract_regulatory(["公司2020年被证监会立案调查。"])
+    assert year_fail["status"] == "fail"
+    year_warn = E.extract_regulatory(["公司2024年收到证监局警示函。"])
+    assert year_warn["status"] == "warn"
+    # "被处罚"（非"受到处罚"）也应识别为真实处罚
+    beichufa = E.extract_regulatory(["十、公司被处罚款 10 万元。"])
+    assert beichufa["status"] == "warn"
+    # 真实处罚句含"不适用"时，不得按"不适用披露"跳过
+    not_applicable = E.extract_regulatory(
+        ["控股股东被立案调查，相关主体不适用豁免。"])
+    assert not_applicable["status"] == "fail"
+
+
+def test_regulatory_linebreak_and_commitment_false_positives():
+    """2026-10-25 复核修正：跨行否定/承诺函/假设句/风险表述/表格字段不得误报。"""
+    # PDF 在"被/监管"间断行：否定语境不得丢失（比亚迪 002594 实盘误报）
+    byd = E.extract_regulatory(
+        ["截至报告期末，公司治理的实际状况符合有关要求，未收到被\n"
+         "监管部门采取行政监管措施的有关文件。"])
+    assert byd["status"] == "clear"
+
+    # 长定语否定句：否定词距"立案"约 30 字符（中芯 688981 承诺函实盘误报）
+    smic_long_neg = E.extract_regulatory(
+        ["本公司不存在因涉嫌犯罪正被司法机关立案侦查或涉嫌违法违规正被"
+         "中国证监会立案调查的情形。"])
+    assert smic_long_neg["status"] == "clear"
+
+    # 承诺函假设句："如本次交易因…被立案调查的"不是已发生事实
+    hypothetical = E.extract_regulatory(
+        ["2. 如本次交易因本企业涉嫌所提供的信息存在虚假记载被司法机关立案侦查"
+         "或者被中国证监会立案调查的，在案件调查结论明确以前，不转让股份。"])
+    assert hypothetical["status"] == "clear"
+
+    # 承诺函兜底条款中的"受到行政处罚产生的罚款"不是处罚事实（神华 601088 实盘误报）
+    compensation = E.extract_regulatory(
+        ["如因标的公司未取得必要业务资质导致中国神华或标的公司在本次交易完成后"
+         "遭受损失（包括受到行政处罚产生的罚款等），国家能源集团公司应当予以补偿。"])
+    assert compensation["status"] == "clear"
+
+    # 风险描述（"行政处罚风险明显增加"）不是处罚事实
+    risk = E.extract_regulatory(
+        ["公司面临的合规监督和行政处罚风险明显增加。"])
+    assert risk["status"] == "clear"
+
+    # 表格披露字段���（"因环境问题受到行政处罚的情况…（如有）"）不是处罚事实
+    table_field = E.extract_regulatory(
+        ["报告期内募集资金所投向的绿色项目发生重大污染责任事故、因环境问题受到"
+         "行政处罚的情况和其他环境违法事件等信息，及是否会对偿债产生重大影响（如有）"])
+    assert table_field["status"] == "clear"
+
+    # 长否定句末尾"…的情形"：否定覆盖全句（中芯 688981 p97）
+    scope_neg = E.extract_regulatory(
+        ["1. 截至本承诺函签署日，本公司不存在因涉嫌犯罪正被司法机关立案侦查或"
+         "涉嫌违法违规正被中国证监会立案调查的情形。"])
+    assert scope_neg["status"] == "clear"
+
+    # "…诉讼、仲裁、行政处罚，亦不存在被监管部门…立案调查"（松发 603268 实盘误报）
+    listed_neg = E.extract_regulatory(
+        ["本公司不存在影响公司正常经营的抵押、质押、冻结、司法查封等权利受限情况"
+         "或诉讼、仲裁、行政处罚，亦不存在被监管部门、司法机关立案调查、"
+         "采取强制措施的情形。"])
+    assert listed_neg["status"] == "clear"
+
+    # 页眉（"…2025 年年度报告98 / 232"）不得与正文拼成假事实
+    header = E.extract_regulatory(
+        ["中芯国际集成电路制造有限公司2025 年年度报告98 / 232违反证券法律、"
+         "行政法规、规章受到中国证监会的行政处罚的情形。"])
+    assert header["status"] == "clear"
+
+
+def test_regulatory_positive_detention_after_checkbox():
+    """√适用 之后的真实"高管被实施留置"必须保留 WARN（茅台 600519 p39）。
+
+    勾选项"√适用 □不适用"不得被当作否定语境（否则真实事件被静默吞掉）。
+    """
+    data = E.extract_regulatory(
+        ["√适用 □不适用详见 2026 年 3月 14 日披露的《贵州茅台关于高级管理人员"
+         "被实施留置的公告》（公告编号：临 2026-004）。"])
+    assert data["status"] == "warn"
+    assert R.rule_5_9(data).verdict is MsVerdict.WARN
+
+
+# ---------- 2026-10-25 复核修正：1.3 运费语境/阶跃 / 5.4 换届 / 5.2 披露豁免 ----------
+
+def test_freight_requires_expense_context_and_rejects_related_party_table():
+    # 期间费用附注正例：销售费用中的运输费
+    ok = E.extract_freight(["销售费用 运输费 12,000,000.00 10,000,000.00"])
+    assert ok["status"] == "ok"
+    assert R.rule_1_3(ok, 0.1).verdict in (MsVerdict.PASS, MsVerdict.WARN, MsVerdict.FAIL)
+    # 关联方交易表（松发 603268 p209）：不得当运费附注
+    related = E.extract_freight(
+        ["关联方交易 恒力海运（大连）有限公司 接受劳务 运输费 "
+         "1,247,973.74 183,486.24"])
+    assert related["status"] != "ok"
+    # 无费用/附注语境：宁漏勿错
+    bare = E.extract_freight(["运输费 1,247,973.74 183,486.24"])
+    assert bare["status"] != "ok"
+
+
+def test_freight_rule_skips_on_revenue_step_change():
+    # 营收 +7774%（借壳并表）→ 运费对比无意义，SKIP（松发 603268）
+    freight = {"status": "ok", "current": 1_247_973.74,
+               "previous": 183_486.24, "growth": 5.80}
+    assert R.rule_1_3(freight, 77.74).verdict is MsVerdict.SKIP
+    # 正常营收增速仍按原规则判定：运费下降 20% vs 营收 +10% → 比值 <25% → FAIL
+    falling = {"status": "ok", "current": 80.0, "previous": 100.0, "growth": -0.2}
+    assert R.rule_1_3(falling, 0.10).verdict is MsVerdict.FAIL
+
+
+def test_independent_director_reshuffle_is_not_collective_resignation():
+    # 松发 603268：借壳后提前换届 + 同日新聘，证据全是"离任"而非"辞职" → clear
+    pages = [
+        "独立董事邹健（离任）独立董事黄伟坤（离任）独立董事刘瑛（离任）",
+        "公司第六届董事会原定任期终止日期为 2027 年 11 月，鉴于已实施重大资产置换"
+        "及发行股份购买资产，决定提前进行换届选举。",
+        "同日选举李志文、周波、许浩然为独立董事。",
+    ]
+    data = E.extract_independent_director(pages)
+    assert data["status"] == "clear"
+    assert R.rule_5_4(data).verdict is MsVerdict.PASS
+    # 真实辞职仍能识别（两人同句）
+    real = E.extract_independent_director(["独立董事张某辞职，独立董事李某辞任。"])
+    assert real["status"] == "found" and real["count"] >= 2
+
+
+def test_freight_cost_composition_table_accepted():
+    """营业成本构成表（茅台 600519 p11）：表内无"销售费用"字样也应能提取。"""
+    pages = [
+        "主营业务成本构成\n直接材料 7,607,858,939.76 51.38 6,895,320,421.92 50.59\n"
+        "直接人工 5,499,482,112.67 37.14 5,224,448,485.08 38.32\n"
+        "制造费用 902,282,395.06 6.10 776,373,890.79 5.70\n"
+        "运输费 326,866,386.45 2.21 311,524,380.58 2.29\n"
+        "合计 14,805,900,139.59 100.00 13,629,995,812.89 100.00"
+    ]
+    data = E.extract_freight(pages)
+    assert data["status"] == "ok"
+    assert data["current"] == 326_866_386.45
+    assert data["previous"] == 311_524_380.58
+
+
+def test_regulatory_real_penalty_with_trailing_conditional():
+    """真处罚句尾部带"如果/将面临处罚"不得被假设语境误杀。"""
+    data = E.extract_regulatory(
+        ["公司被中国证监会立案调查，如果最终认定违规，公司将面临处罚。"])
+    assert data["status"] == "fail"
+    # 无逗号的转折但书：否定不覆盖后一分句
+    data2 = E.extract_regulatory(["公司不存在违规行为但控股股东被立案调查。"])
+    assert data2["status"] == "fail"
+    # 真处罚 + 赔偿责任（非"予以赔偿/补偿"承诺句式）保留
+    data3 = E.extract_regulatory(["公司被证监会立案调查，可能需承担赔偿责任。"])
+    assert data3["status"] == "fail"
+
+
+def test_regulatory_page_header_merged_line_keeps_body():
+    """页眉与正文被 pypdf 拼到同一行：剥页眉后正文真实处罚仍须识别。"""
+    data = E.extract_regulatory(
+        ["公司2025 年年度报告95 / 232公司被证监会立案调查。"])
+    assert data["status"] == "fail"
+
+
+def test_supplement_5_2_holder_event_override():
+    pages = [
+        "前十名股东情况 中国长江三峡集团有限公司部分持股减少，主要原因一是其持有"
+        "的 978,728,709 股股份无偿划转至其全资子公司长江生态环保集团有限公司；"
+        "二是其发行的可交换债券进入换股期，有投资者换股所致。"
+    ]
+    events = E.extract_holder_events(pages)
+    assert events["status"] == "found"
+    override = R.supplement_5_2(events)
+    assert override is not None and override.verdict is MsVerdict.PASS
+    # 无"持股减少"语境 → 不覆盖
+    unrelated = E.extract_holder_events(["公司发行可交换公司债券的公告。"])
+    assert R.supplement_5_2(unrelated) is None

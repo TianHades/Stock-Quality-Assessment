@@ -5,10 +5,11 @@ import os
 from datetime import datetime
 
 from sqa.config import Thresholds, load_thresholds
-from sqa.data.fetchers import compute_fcf, fetch_basic, resolve_ts_code
+from sqa.data.fetchers import fetch_basic, ocf_minus_capex, resolve_ts_code
 from sqa.data.tushare_client import SqaDataError, TushareClient
 from sqa.minesweeper.fetch import (
-    fetch_annual_full, fetch_audit, fetch_holder_ratio_series, fetch_pledge_ratio,
+    fetch_annual_full, fetch_audit, fetch_holder_series, fetch_pledge_ratio,
+    holder_ratio_series,
 )
 from sqa.minesweeper.models import MsResult, assess
 from sqa.minesweeper import rules_financial as fin
@@ -58,8 +59,9 @@ def run_minesweeper(symbol: str, cfg: Thresholds | None = None,
         audit_rows = []
     if historical:
         pledge_ratio = fetch_pledge_ratio(client, ts_code, refresh, as_of=as_of)
-        holders = fetch_holder_ratio_series(client, ts_code, refresh=refresh,
-                                            as_of=as_of)
+        holder_periods = fetch_holder_series(client, ts_code, refresh=refresh,
+                                             as_of=as_of)
+        holders = holder_ratio_series(holder_periods)
         try:
             peers = fetch_peer_medians(client, basic.industry, refresh,
                                        include_bad_debt=True, exclude_code=ts_code,
@@ -68,7 +70,8 @@ def run_minesweeper(symbol: str, cfg: Thresholds | None = None,
             peers = None
     else:
         pledge_ratio = fetch_pledge_ratio(client, ts_code, refresh)
-        holders = fetch_holder_ratio_series(client, ts_code, refresh=refresh)
+        holder_periods = fetch_holder_series(client, ts_code, refresh=refresh)
+        holders = holder_ratio_series(holder_periods)
         try:
             peers = fetch_peer_medians(client, basic.industry, refresh,
                                        include_bad_debt=True, exclude_code=ts_code)
@@ -91,11 +94,16 @@ def run_minesweeper(symbol: str, cfg: Thresholds | None = None,
     cip = series(balance, "cip")
     fix = series(balance, "fix_assets")
     ocf = series(cashflow, "n_cashflow_act")
-    icf = series(cashflow, "n_cashflow_inv_act")
+    capex = series(cashflow, "c_pay_acq_const_fiolta")
     cash_recv = series(cashflow, "c_fr_sale_sg")
 
     def fcf_of(y: int) -> float | None:
-        return compute_fcf(cashflow.get(y), ind.get(y))
+        # 4.5 口径：FCF = 经营 CF − Capex（与规则文本一致）；缺失时回退 fcff。
+        # 不用 compute_fcf 的 free_cashflow 优先口径（会与规则定义混用）。
+        value = ocf_minus_capex(cashflow.get(y))
+        if value is not None:
+            return value
+        return (ind.get(y) or {}).get("fcff")
 
     fcf = [fcf_of(y) for y in years]
 
@@ -110,7 +118,14 @@ def run_minesweeper(symbol: str, cfg: Thresholds | None = None,
         fin_exp_latest = income_latest.get("fin_exp")
         interest_exp_latest = fin_exp_latest if fin_exp_latest and fin_exp_latest > 0 else None
 
-    holder_drop = (holders[-2] - holders[-1]) if len(holders) >= 2 else None
+    # S4 口径（02 §3）：近 2 年大股东持股比例降幅（原实现只比最近两期 ≈1 年）
+    positive = [h for h in holders if h is not None]
+    if len(positive) >= 3:
+        holder_drop = positive[-3] - positive[-1]
+    elif len(positive) >= 2:
+        holder_drop = positive[0] - positive[-1]
+    else:
+        holder_drop = None
 
     # ---- 规则执行（快筛模式；深度模式 PDF 规则暂以 SKIP 占位）----
     results: list[MsResult] = [
@@ -122,12 +137,12 @@ def run_minesweeper(symbol: str, cfg: Thresholds | None = None,
         fin.rule_1_4(income_rows),
         fin.rule_1_5(income_rows),
         fin.rule_1_6(income_rows),
-        fin.rule_2_1(ocf, icf),
+        fin.rule_2_1(ocf, capex),
         fin.rule_2_2(ocf),
         fin.rule_2_3(balance_latest, interest_exp_latest, cfg.ms_base_rate),
         fin.rule_3_1(ar, revenue),
         fin.rule_3_2(inv_turn, gm),
-        fin.rule_3_3(cip, fix),
+        fin.rule_3_3(cip, fix, ta),
         fin.rule_3_4(balance_rows, ta),
         fin.rule_3_5(income_latest, balance_latest, peers),
         fin.rule_4_1(ocf, np_),
@@ -136,7 +151,7 @@ def run_minesweeper(symbol: str, cfg: Thresholds | None = None,
         fin.rule_4_4(income_latest),
         fin.rule_4_5(np_, fcf),
         nonfin.rule_5_1(audit_rows),
-        nonfin.rule_5_2(holders),
+        nonfin.rule_5_2(holder_periods),
         nonfin.rule_5_3(), nonfin.rule_5_4(), nonfin.rule_5_5(), nonfin.rule_5_6(),
         nonfin.rule_5_7(balance_latest),
         nonfin.rule_5_8(balance_rows, ta),
@@ -174,14 +189,25 @@ def run_minesweeper(symbol: str, cfg: Thresholds | None = None,
             override = deep.get("override_5_8")
             if override is not None:
                 results = [override if r.rule == "5.8" else r for r in results]
+            # 5.2 深度模式补充：仅当快筛判 WARN/FAIL 且年报明确披露"划转/EB 换股
+            # 导致持股减少"时覆盖为 PASS（避免无披露时放宽真实减持）
+            override_52 = deep.get("override_5_2")
+            if override_52 is not None:
+                results = [
+                    override_52 if (r.rule == "5.2"
+                                    and r.verdict.value in ("WARN", "FAIL")) else r
+                    for r in results
+                ]
         deep_info = {k: v for k, v in deep.items()
-                     if k not in ("rules", "override_5_8", "evidence")}
+                     if k not in ("rules", "override_5_8", "override_5_2", "evidence")}
         deep_info["evidence"] = deep.get("evidence", {})
         if deep.get("status") == "ok":
             deep_info["verdicts"] = {r.rule: r.verdict.value
                                      for r in deep.get("rules", [])}
             if deep.get("override_5_8") is not None:
                 deep_info["verdicts"]["5.8"] = deep["override_5_8"].verdict.value
+            if deep.get("override_5_2") is not None:
+                deep_info["verdicts"]["5.2"] = deep["override_5_2"].verdict.value
 
     gate = assess(results, cfg.ms_gate_extreme, cfg.ms_gate_high, cfg.ms_gate_mid)
 

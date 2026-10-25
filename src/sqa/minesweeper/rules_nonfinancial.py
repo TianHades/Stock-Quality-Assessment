@@ -101,20 +101,129 @@ def rule_5_1(audit_rows: list[dict]) -> MsResult:
     return MsResult("5.1", "L5", MsVerdict.WARN, f"近{_AGENCY_WINDOW}年更换审计机构 1 次")
 
 
-def rule_5_2(holder_ratio_series: list[float | None]) -> MsResult:
-    """大股东减持（第一大股东持股比例趋势，近似口径）。"""
-    vals = [v for v in holder_ratio_series if v is not None]
-    if len(vals) < 2:
-        return MsResult("5.2", "L5", MsVerdict.SKIP, "股东持股数据不足")
+def _largest_holder_track(periods: list[dict]) -> tuple[list[dict], str]:
+    """以最新一期非名义第一大股东为基准，回溯同名股东逐期持股记录。"""
+    latest = (periods[-1].get("holders") or []) if periods else []
+    candidates = [h for h in latest if not h.get("nominee")] or latest
+    if not candidates:
+        return [], ""
+    target = max(candidates, key=lambda h: h["ratio"])
+    name = str(target.get("name") or "")
+    if not name:
+        return [], ""
+    tracked: list[dict] = []
+    for period in periods:
+        match = next((h for h in period.get("holders") or []
+                      if str(h.get("name") or "") == name), None)
+        if match is not None:
+            tracked.append({**match, "end_date": period.get("end_date")})
+    return tracked, name
 
-    drop = vals[0] - vals[-1]  # 首期到末期
-    declining = all(vals[i + 1] <= vals[i] for i in range(len(vals) - 1))
+
+def _ratio_series_verdict(vals: list[float | None]) -> MsResult:
+    """兜底：仅有持股比例序列时的旧口径（首末期比例差）。"""
+    clean = [v for v in vals if v is not None]
+    if len(clean) < 2:
+        return MsResult("5.2", "L5", MsVerdict.SKIP, "股东持股数据不足")
+    drop = clean[0] - clean[-1]
+    declining = all(clean[i + 1] <= clean[i] for i in range(len(clean) - 1))
     if drop > 5:
         return MsResult("5.2", "L5", MsVerdict.FAIL, f"第一大股东持股下降 {drop:.1f}pp")
     if declining and drop > 0.5:
         return MsResult("5.2", "L5", MsVerdict.WARN,
                         f"第一大股东持股连续下降（累计 {drop:.1f}pp）")
-    return MsResult("5.2", "L5", MsVerdict.PASS, f"第一大股东持股稳定（变化 {drop:+.1f}pp）")
+    if drop > 0.5:
+        return MsResult("5.2", "L5", MsVerdict.PASS,
+                        f"第一大股东持股下降 {drop:.1f}pp（非连续，未构成趋势性减持）")
+    if drop < -0.5:
+        return MsResult("5.2", "L5", MsVerdict.PASS,
+                        f"第一大股东持股比例上升 {abs(drop):.1f}pp")
+    return MsResult("5.2", "L5", MsVerdict.PASS,
+                    f"第一大股东持股稳定（变化 {drop:+.1f}pp）")
+
+
+def _rule_5_2_detail(periods: list[dict]) -> MsResult:
+    """5.2 明细口径（2026-10-25 复核修正）：股数口径 + 名义持有人剔除。
+
+    原实现用"第一大股东比例首末差"判减持，会把发行股份购买资产/配套融资的
+    稀释、同一控制下无偿划转、可交换债换股全部误判为减持（长江电力 8.78pp
+    实为上述三项，2022→2025 持股数量仅 −2.02%）。现改为：
+    - 追溯最新一期真实第一大股东（剔除 HKSCC/中央结算等名义持有人）；
+    - 以**持股数量**变化判减持：比例下降但股数未降 → PASS（稀释）；
+    - 股数减少 >5% → FAIL；连续逐期减少且累计 >1% → WARN；
+    - 小幅非连续减少 → PASS（不构成趋势性减持；划转/EB 细节由深度模式复核）。
+    """
+    tracked, name = _largest_holder_track(periods)
+    if len(tracked) < 2:
+        fallback: list[float | None] = []
+        largest_names: list[str] = []
+        for period in periods or []:
+            holders = period.get("holders") or []
+            cand = [h for h in holders if not h.get("nominee")] or holders
+            if not cand:
+                fallback.append(None)
+                continue
+            largest = max(cand, key=lambda h: h["ratio"])
+            fallback.append(largest["ratio"])
+            if largest.get("name"):
+                largest_names.append(str(largest["name"]))
+        result = _ratio_series_verdict(fallback)
+        distinct = list(dict.fromkeys(largest_names))
+        if len(distinct) >= 2:
+            return MsResult(
+                "5.2", "L5", result.verdict,
+                result.detail + "；第一大股东主体发生变化（"
+                + "→".join(distinct[:3]) + "），按比例序列判定")
+        return result
+
+    ratios = [h.get("ratio") for h in tracked]
+    amounts = [h.get("amount") for h in tracked]
+    if any(a is None for a in amounts) or not amounts[0] \
+            or any(r is None for r in ratios):
+        return _ratio_series_verdict(ratios)
+
+    start, end = float(amounts[0]), float(amounts[-1])
+    change_pct = (end - start) / start * 100.0
+    ratio_change = ((ratios[-1] or 0.0) - (ratios[0] or 0.0))
+    declining = all(float(amounts[i + 1]) < float(amounts[i])
+                    for i in range(len(amounts) - 1))
+    detail = (f"第一大股东 {name} 持股数量 {change_pct:+.1f}%"
+              f"（比例 {ratios[0]:.2f}%→{ratios[-1]:.2f}%，变化 {ratio_change:+.2f}pp）")
+    if change_pct > 0.5:
+        if ratio_change < -0.2:
+            return MsResult(
+                "5.2", "L5", MsVerdict.PASS,
+                detail + "；持股数量增加但比例下降（送转/配售等名义变动或股本扩张）")
+        return MsResult("5.2", "L5", MsVerdict.PASS,
+                        detail + "；持股数量增加（含增持/送转/同一控制下划转等）")
+    if change_pct >= -1e-9:
+        if ratio_change < -0.2:
+            return MsResult("5.2", "L5", MsVerdict.PASS,
+                            detail + "；持股数量未减，比例下降由股本扩张/稀释解释")
+        return MsResult("5.2", "L5", MsVerdict.PASS,
+                        detail + "；持股数量与比例基本未变")
+    if change_pct < -5.0:
+        return MsResult("5.2", "L5", MsVerdict.FAIL, detail + "；持股数量减少 >5%")
+    if declining and change_pct < -1.0:
+        return MsResult("5.2", "L5", MsVerdict.WARN,
+                        detail + "；连续减持但幅度 <5%")
+    return MsResult("5.2", "L5", MsVerdict.PASS,
+                    detail + "；小幅非连续减少，未构成趋势性减持")
+
+
+def rule_5_2(holder_ratio_series: list) -> MsResult:
+    """大股东减持（第一大股东持股趋势）。
+
+    兼容两种输入：``fetch_holder_series`` 的逐期明细（推荐，含股东名称与持股
+    数量）或旧的比例序列（float/None 列表）；其他 dict 列表按 ratio 字段降级。
+    """
+    if holder_ratio_series and isinstance(holder_ratio_series[0], dict):
+        if "holders" in holder_ratio_series[0]:
+            return _rule_5_2_detail(holder_ratio_series)
+        ratios = [h.get("ratio") if isinstance(h, dict) else h
+                  for h in holder_ratio_series]
+        return _ratio_series_verdict(ratios)
+    return _ratio_series_verdict(holder_ratio_series)
 
 
 def rule_5_3() -> MsResult:
